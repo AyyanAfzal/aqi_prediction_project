@@ -585,8 +585,15 @@ def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
     logger.info("Rows to insert: %s", len(df_to_insert))
     logger.info("Columns to insert: %s", len(df_to_insert.columns))
 
+# Fix Hopsworks schema type mismatch
+    if "openmeteo_us_aqi_reference" in df_to_insert.columns:
+        df_to_insert["openmeteo_us_aqi_reference"] = pd.to_numeric(
+            df_to_insert["openmeteo_us_aqi_reference"],
+            errors="coerce"
+        ).astype("float64")        
     # Avoid waiting for Hopsworks materialization logs, because the wait step can
     # randomly fail with connection drops even when upload has started correctly.
+    logging.info("Insert dataframe dtypes:\n%s", df_to_insert.dtypes)
     fg.insert(df_to_insert, write_options={"wait_for_job": False})
 
     logger.info("Forecast features submitted to Hopsworks successfully.")

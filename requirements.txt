@@ -12,3 +12,4 @@ joblib
 matplotlib
 streamlit
 plotly
+shap

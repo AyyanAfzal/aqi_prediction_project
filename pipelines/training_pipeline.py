@@ -1,16 +1,3 @@
-"""
-Training Pipeline — Open-Meteo 12-Feature AQI Model
-===================================================
-
-Reads historical training features from Hopsworks, trains Ridge Regression,
-Random Forest, and XGBoost, compares MAE/RMSE/R², selects the best model by
-lowest RMSE, saves local artifacts, and uploads the best model to Hopsworks.
-
-Run:
-    python pipelines/training_pipeline.py --no-register
-    python pipelines/training_pipeline.py
-"""
-
 from __future__ import annotations
 
 import argparse

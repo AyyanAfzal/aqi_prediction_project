@@ -1,29 +1,39 @@
+
 """
-Feature Pipeline for Serverless AQI Predictor
+Feature Pipeline — Raw + 12 Derived Open-Meteo Features
+======================================================
 
-City: Hyderabad, Sindh, Pakistan
-Data source: Open-Meteo
-Feature store: Hopsworks
+Purpose:
+- Fetch recent past + future Open-Meteo air-quality and weather forecast data.
+- Keep raw pollutant/weather features for EDA and dashboard analysis.
+- Derive the final 12 model features used for AQI prediction.
+- Keep Open-Meteo us_aqi as reference/target column, but never as an input feature.
+- Select next 72 future hours.
+- Save locally and optionally upload to Hopsworks.
 
-Pipeline:
-1. Load config from .env
-2. Get Hyderabad, Sindh coordinates
-3. Fetch hourly air-quality data from Open-Meteo
-4. Fetch hourly weather data from Open-Meteo
-5. Merge AQI + weather data on event_time
-6. Clean and preprocess dataframe
-7. Add time, interaction, lag, and rolling features
-8. Insert/upsert features into Hopsworks Feature Group
+Final ML logic:
+    predicted_aqi(t) = f(12 derived pollutant/weather features at time t)
 
-No ML training happens in this file.
+Important:
+- Raw features are stored for EDA/reporting.
+- Model should use only MODEL_FEATURE_COLUMNS.
+- openmeteo_us_aqi_reference is target/reference, not input.
+- Rolling windows are calculated on recent past + future forecast together.
+- Only after rolling features are created do we filter the next 72 future rows.
+
+Run:
+    python pipelines/feature_pipeline.py --no-upload
+    python pipelines/feature_pipeline.py
 """
 
 from __future__ import annotations
 
-import os
+import argparse
 import logging
-from pathlib import Path
+import os
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -33,782 +43,585 @@ from dotenv import load_dotenv
 import hopsworks
 
 
-# ============================================================
-# Logging
-# ============================================================
+# ─────────────────────────────────────────────────────────────
+# Setup
+# ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# Paths
-# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = PROJECT_ROOT / ".env"
+DATA_DIR = PROJECT_ROOT / "data"
+REPORTS_DIR = PROJECT_ROOT / "reports"
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============================================================
-# Columns
-# ============================================================
+AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
-AIR_QUALITY_COLUMNS = [
-    "us_aqi",
-    "pm10",
-    "pm2_5",
-    "carbon_monoxide",
-    "nitrogen_dioxide",
-    "sulphur_dioxide",
-    "ozone",
-    "dust",
-    "uv_index",
-]
-
-WEATHER_COLUMNS = [
-    "temperature_2m",
-    "relative_humidity_2m",
-    "dew_point_2m",
-    "precipitation",
-    "rain",
-    "surface_pressure",
-    "cloud_cover",
-    "wind_speed_10m",
-    "wind_direction_10m",
-    "wind_gusts_10m",
-]
-
-METADATA_COLUMNS = [
-    "city",
-    "country",
-    "latitude",
-    "longitude",
-    "event_time",
-    "ingestion_time",
-    "source",
-]
-
+REFERENCE_COLUMN = "openmeteo_us_aqi_reference"
 TARGET_COLUMN = "us_aqi"
 
+# Gas conversion constants.
+# Open-Meteo gas values are in µg/m³.
+O3_TO_PPB = 24.465 / 48
+NO2_TO_PPB = 24.465 / 46
+CO_TO_PPM = 24.465 / (28 * 1000)
 
-# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# Columns
+# ─────────────────────────────────────────────────────────────
+
+RAW_AIR_QUALITY_COLUMNS = [
+    "pm25",
+    "pm10",
+    "carbon_monoxide",
+    "nitrogen_dioxide",
+    "ozone",
+]
+
+RAW_WEATHER_COLUMNS = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "precipitation",
+    "windspeed_10m",
+    "surface_pressure",
+    "shortwave_radiation",
+    "et0_fao_evapotranspiration",
+]
+
+RAW_FEATURE_COLUMNS = RAW_AIR_QUALITY_COLUMNS + RAW_WEATHER_COLUMNS
+
+MODEL_FEATURE_COLUMNS = [
+    "pm25_24h",
+    "pm10_24h",
+    "o3_8h_ppb",
+    "co_8h_ppm",
+    "no2_1h_ppb",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "precipitation",
+    "windspeed_10m",
+    "surface_pressure",
+    "shortwave_radiation",
+    "et0_fao_evapotranspiration",
+]
+
+DERIVED_DIAGNOSTIC_COLUMNS = [
+    "o3_8h",
+    "co_8h",
+    "no2_1h",
+]
+
+CLIP_BOUNDS = {
+    # Raw pollutants
+    "pm25": (0, 500),
+    "pm10": (0, 600),
+    "carbon_monoxide": (0, 60000),
+    "nitrogen_dioxide": (0, 4000),
+    "ozone": (0, 1000),
+
+    # Raw weather
+    "temperature_2m": (-10, 55),
+    "relative_humidity_2m": (0, 100),
+    "precipitation": (0, 200),
+    "windspeed_10m": (0, 150),
+    "surface_pressure": (900, 1100),
+    "shortwave_radiation": (0, 1200),
+    "et0_fao_evapotranspiration": (0, 20),
+
+    # Derived features
+    "pm25_24h": (0, 500),
+    "pm10_24h": (0, 600),
+    "o3_8h_ppb": (0, 300),
+    "co_8h_ppm": (0, 50),
+    "no2_1h_ppb": (0, 2049),
+
+    # Reference
+    REFERENCE_COLUMN: (0, 500),
+}
+
+# Keep output columns unique.
+# NOTE:
+# The 12 model features already include 7 raw weather columns:
+# temperature_2m, relative_humidity_2m, precipitation, windspeed_10m,
+# surface_pressure, shortwave_radiation, et0_fao_evapotranspiration.
+# If we add RAW_FEATURE_COLUMNS and MODEL_FEATURE_COLUMNS directly,
+# those weather columns appear twice. Hopsworks then sees duplicate
+# column names and can crash with: DataFrame object has no attribute dtype.
+FORECAST_OUTPUT_COLUMNS = list(dict.fromkeys([
+    "city",
+    "timestamp",
+    "ingestion_timestamp",
+    "forecast_run_timestamp",
+    "is_future",
+
+    # Raw Open-Meteo features for EDA/dashboard/debugging
+    *RAW_FEATURE_COLUMNS,
+
+    # Intermediate derived features for EDA/debugging
+    *DERIVED_DIAGNOSTIC_COLUMNS,
+
+    # Final model features
+    *MODEL_FEATURE_COLUMNS,
+
+    # Reference/target from Open-Meteo; do not use as model input
+    REFERENCE_COLUMN,
+]))
+
+
+# ─────────────────────────────────────────────────────────────
 # Config
-# ============================================================
+# ─────────────────────────────────────────────────────────────
 
 def str_to_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
-
     return value.strip().lower() in {"true", "1", "yes", "y"}
 
 
 def load_config() -> dict[str, Any]:
-    """
-    Load environment variables from .env.
-    """
-
     load_dotenv(ENV_PATH)
 
-    config = {
-        "city_name": os.getenv("CITY_NAME", "Hyderabad"),
+    return {
+        "city_name": os.getenv("CITY_NAME", os.getenv("CITY", "Hyderabad")),
         "country_code": os.getenv("COUNTRY_CODE", "PK"),
         "timezone": os.getenv("TIMEZONE", "Asia/Karachi"),
 
-        "past_days": int(os.getenv("OPENMETEO_PAST_DAYS", "2")),
-        "forecast_days": int(os.getenv("OPENMETEO_FORECAST_DAYS", "3")),
+        "latitude": os.getenv("LATITUDE"),
+        "longitude": os.getenv("LONGITUDE"),
 
-        "hopsworks_host": os.getenv("HOPSWORKS_HOST"),
-        "hopsworks_project": os.getenv("HOPSWORKS_PROJECT"),
+        "past_days": int(os.getenv("FORECAST_PAST_DAYS", os.getenv("OPENMETEO_PAST_DAYS", "2"))),
+        "forecast_days": int(os.getenv("FORECAST_DAYS", os.getenv("OPENMETEO_FORECAST_DAYS", "5"))),
+        "prediction_hours": int(os.getenv("PREDICTION_HOURS", "72")),
+
+        "hopsworks_host": os.getenv("HOPSWORKS_HOST", "eu-west.cloud.hopsworks.ai"),
+        "hopsworks_project": os.getenv("HOPSWORKS_PROJECT", os.getenv("HOPSWORKS_PROJECT_NAME")),
         "hopsworks_api_key": os.getenv("HOPSWORKS_API_KEY"),
 
-        "feature_group_name": os.getenv("HOPSWORKS_FEATURE_GROUP", "aqi_features"),
-        "feature_group_version": int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "1")),
+        "forecast_feature_group_name": os.getenv(
+            "FORECAST_FEATURE_GROUP_NAME",
+            os.getenv("HOPSWORKS_FORECAST_FEATURE_GROUP", "aqi_openmeteo_12f_forecast_fg"),
+        ),
+        "forecast_feature_group_version": int(
+            os.getenv("FORECAST_FEATURE_GROUP_VERSION", os.getenv("HOPSWORKS_FORECAST_FEATURE_GROUP_VERSION", "1"))
+        ),
+
         "online_enabled": str_to_bool(os.getenv("HOPSWORKS_ONLINE_ENABLED"), default=False),
+
+        "local_forecast_output_path": PROJECT_ROOT / os.getenv(
+            "FORECAST_FEATURE_OUTPUT_PATH",
+            "reports/latest_72h_forecast_features.csv",
+        ),
     }
 
-    return config
+
+def validate_config(cfg: dict[str, Any], upload: bool) -> None:
+    if cfg["past_days"] < 2:
+        raise ValueError("FORECAST_PAST_DAYS must be at least 2 for 24-hour rolling windows.")
+
+    if cfg["forecast_days"] < 5:
+        logger.warning("FORECAST_DAYS < 5 may return fewer than 72 future hours late in the day.")
+
+    if upload:
+        required = [
+            "hopsworks_host",
+            "hopsworks_project",
+            "hopsworks_api_key",
+            "forecast_feature_group_name",
+            "forecast_feature_group_version",
+        ]
+        missing = [key for key in required if not cfg.get(key)]
+        if missing:
+            raise ValueError(f"Missing .env values for upload: {missing}")
+
+    logger.info("City: %s", cfg["city_name"])
+    logger.info("Timezone: %s", cfg["timezone"])
+    logger.info("Past days: %s", cfg["past_days"])
+    logger.info("Forecast days: %s", cfg["forecast_days"])
+    logger.info("Prediction hours: %s", cfg["prediction_hours"])
+    logger.info("Raw feature count: %s", len(RAW_FEATURE_COLUMNS))
+    logger.info("Model feature count: %s", len(MODEL_FEATURE_COLUMNS))
+    logger.info("Total output columns: %s", len(FORECAST_OUTPUT_COLUMNS))
+    logger.info("Forecast FG: %s v%s", cfg["forecast_feature_group_name"], cfg["forecast_feature_group_version"])
 
 
-def validate_config(config: dict[str, Any]) -> None:
-    """
-    Validate all required configuration values.
-    """
-
-    required_keys = [
-        "city_name",
-        "country_code",
-        "timezone",
-        "hopsworks_host",
-        "hopsworks_project",
-        "hopsworks_api_key",
-        "feature_group_name",
-        "feature_group_version",
-    ]
-
-    missing = [key for key in required_keys if not config.get(key)]
-
-    if missing:
-        raise ValueError(f"Missing required config values: {missing}")
-
-    logger.info("Config loaded successfully.")
-    logger.info("City: %s", config["city_name"])
-    logger.info("Country code: %s", config["country_code"])
-    logger.info("Timezone: %s", config["timezone"])
-    logger.info("Past days: %s", config["past_days"])
-    logger.info("Forecast days: %s", config["forecast_days"])
-    logger.info("Hopsworks host: %s", config["hopsworks_host"])
-    logger.info("Hopsworks project: %s", config["hopsworks_project"])
-    logger.info(
-        "Feature Group: %s v%s",
-        config["feature_group_name"],
-        config["feature_group_version"],
-    )
-
-
-# ============================================================
+# ─────────────────────────────────────────────────────────────
 # API helpers
-# ============================================================
+# ─────────────────────────────────────────────────────────────
 
-def get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
-    """
-    Make GET request and return JSON.
-    """
+def get_json(url: str, params: dict[str, Any], retries: int = 5, timeout: int = 120) -> dict[str, Any]:
+    last_error = None
 
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as error:
+            last_error = error
+            logger.warning("API failed attempt %s/%s: %s", attempt, retries, error)
+            if attempt < retries:
+                time.sleep(attempt * 5)
+
+    raise RuntimeError(f"API request failed after {retries} attempts: {last_error}")
 
 
-def get_city_coordinates(config: dict[str, Any]) -> dict[str, Any]:
-    """
-    Get coordinates for Hyderabad, Sindh, Pakistan using Open-Meteo Geocoding API.
-    """
-
-    logger.info("Fetching coordinates for Hyderabad, Sindh...")
-
-    url = "https://geocoding-api.open-meteo.com/v1/search"
+def get_city_coordinates(cfg: dict[str, Any]) -> dict[str, Any]:
+    if cfg.get("latitude") and cfg.get("longitude"):
+        return {
+            "city": str(cfg["city_name"]).lower().replace(" ", "_"),
+            "country": "pakistan",
+            "latitude": float(cfg["latitude"]),
+            "longitude": float(cfg["longitude"]),
+        }
 
     params = {
-        "name": config["city_name"],
+        "name": cfg["city_name"],
         "count": 10,
         "language": "en",
         "format": "json",
-        "country_code": config["country_code"],
+        "country_code": cfg["country_code"],
     }
 
-    data = get_json(url, params)
+    data = get_json(GEOCODING_URL, params)
     results = data.get("results", [])
 
     if not results:
-        raise ValueError("No city results found from Open-Meteo Geocoding API.")
+        raise ValueError("No location found from Open-Meteo Geocoding API.")
 
-    locations_df = pd.DataFrame(results)
-
-    required_columns = {"name", "country", "admin1", "latitude", "longitude"}
-    missing = required_columns - set(locations_df.columns)
-
-    if missing:
-        raise ValueError(f"Geocoding response missing columns: {missing}")
+    locations = pd.DataFrame(results)
 
     mask = (
-        locations_df["name"].str.lower().eq("hyderabad")
-        & locations_df["country"].str.lower().eq("pakistan")
-        & locations_df["admin1"].str.lower().eq("sindh")
+        locations["name"].str.lower().eq("hyderabad")
+        & locations["country"].str.lower().eq("pakistan")
     )
 
-    selected = locations_df[mask]
+    if "admin1" in locations.columns:
+        mask = mask & locations["admin1"].str.lower().eq("sindh")
 
+    selected = locations[mask]
     if selected.empty:
-        raise ValueError("Could not find Hyderabad, Sindh, Pakistan.")
+        selected = locations.head(1)
 
     row = selected.iloc[0]
 
-    location = {
+    return {
         "city": "hyderabad_sindh",
         "country": "pakistan",
         "latitude": float(row["latitude"]),
         "longitude": float(row["longitude"]),
     }
 
-    logger.info("Selected location: %s", location)
 
-    return location
-
-
-def fetch_air_quality_data(
-    latitude: float,
-    longitude: float,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Fetch hourly air-quality data from Open-Meteo Air Quality API.
-    """
-
-    logger.info("Fetching air-quality data...")
-
-    url = "https://air-quality-api.open-meteo.com/v1/air-quality"
-
+def fetch_air_quality_data(location: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": ",".join(AIR_QUALITY_COLUMNS),
-        "timezone": config["timezone"],
-        "past_days": config["past_days"],
-        "forecast_days": config["forecast_days"],
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+        "timezone": cfg["timezone"],
+        "past_days": cfg["past_days"],
+        "forecast_days": cfg["forecast_days"],
+        "hourly": [
+            "pm2_5",
+            "pm10",
+            "carbon_monoxide",
+            "nitrogen_dioxide",
+            "ozone",
+            "us_aqi",
+        ],
     }
 
-    return get_json(url, params)
+    logger.info("Fetching Open-Meteo air-quality forecast data...")
+    return get_json(AIR_QUALITY_URL, params)
 
 
-def fetch_weather_data(
-    latitude: float,
-    longitude: float,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Fetch hourly weather data from Open-Meteo Forecast API.
-    """
-
-    logger.info("Fetching weather data...")
-
-    url = "https://api.open-meteo.com/v1/forecast"
-
+def fetch_weather_data(location: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": ",".join(WEATHER_COLUMNS),
-        "timezone": config["timezone"],
-        "past_days": config["past_days"],
-        "forecast_days": config["forecast_days"],
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+        "timezone": cfg["timezone"],
+        "past_days": cfg["past_days"],
+        "forecast_days": cfg["forecast_days"],
+        "hourly": [
+            "temperature_2m",
+            "relative_humidity_2m",
+            "precipitation",
+            "windspeed_10m",
+            "surface_pressure",
+            "shortwave_radiation",
+            "et0_fao_evapotranspiration",
+        ],
     }
 
-    return get_json(url, params)
+    logger.info("Fetching Open-Meteo weather forecast data...")
+    return get_json(WEATHER_FORECAST_URL, params)
 
-
-# ============================================================
-# DataFrame conversion
-# ============================================================
 
 def air_quality_to_dataframe(data: dict[str, Any]) -> pd.DataFrame:
-    """
-    Convert Open-Meteo air-quality response to pandas DataFrame.
-    """
-
     hourly = data.get("hourly")
-
     if not hourly:
-        raise ValueError("Air-quality response does not contain hourly data.")
+        raise ValueError("Air-quality response has no hourly data.")
 
-    df = pd.DataFrame(hourly)
-
-    if "time" not in df.columns:
-        raise ValueError("Air-quality dataframe is missing the time column.")
-
-    df["event_time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.drop(columns=["time"])
-
-    logger.info("Air-quality rows: %s", len(df))
-
-    return df
+    return pd.DataFrame(hourly).rename(
+        columns={
+            "time": "timestamp",
+            "pm2_5": "pm25",
+            "us_aqi": REFERENCE_COLUMN,
+        }
+    )
 
 
 def weather_to_dataframe(data: dict[str, Any]) -> pd.DataFrame:
-    """
-    Convert Open-Meteo weather response to pandas DataFrame.
-    """
-
     hourly = data.get("hourly")
-
     if not hourly:
-        raise ValueError("Weather response does not contain hourly data.")
+        raise ValueError("Weather response has no hourly data.")
 
-    df = pd.DataFrame(hourly)
+    return pd.DataFrame(hourly).rename(columns={"time": "timestamp"})
 
-    if "time" not in df.columns:
-        raise ValueError("Weather dataframe is missing the time column.")
 
-    df["event_time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.drop(columns=["time"])
-
-    logger.info("Weather rows: %s", len(df))
-
-    return df
-
+# ─────────────────────────────────────────────────────────────
+# Feature engineering
+# ─────────────────────────────────────────────────────────────
 
 def merge_dataframes(
-    air_quality_df: pd.DataFrame,
+    air_df: pd.DataFrame,
     weather_df: pd.DataFrame,
     location: dict[str, Any],
+    cfg: dict[str, Any],
 ) -> pd.DataFrame:
-    """
-    Merge air-quality and weather data on event_time.
-    """
+    df = pd.merge(air_df, weather_df, on="timestamp", how="inner")
 
-    logger.info("Merging air-quality and weather data...")
+    if df.empty:
+        raise ValueError("Merged forecast dataframe is empty.")
 
-    df = pd.merge(
-        air_quality_df,
-        weather_df,
-        on="event_time",
-        how="inner",
-    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"]).copy()
+
+    current_local_hour = pd.Timestamp.now(tz=cfg["timezone"]).floor("h").tz_localize(None)
+    run_time = datetime.now(timezone.utc).replace(tzinfo=None)
 
     df["city"] = location["city"]
     df["country"] = location["country"]
     df["latitude"] = location["latitude"]
     df["longitude"] = location["longitude"]
-    df["ingestion_time"] = datetime.now(timezone.utc)
-    df["source"] = "open_meteo"
+    df["ingestion_timestamp"] = run_time
+    df["forecast_run_timestamp"] = run_time
+    df["is_future"] = (df["timestamp"] > current_local_hour).astype(int)
 
-    logger.info("Merged rows: %s", len(df))
+    logger.info("Current local hour: %s", current_local_hour)
+    logger.info("Merged forecast shape before features: %s", df.shape)
 
-    return df
-
-
-# ============================================================
-# Cleaning and preprocessing
-# ============================================================
-
-def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize column names to lowercase snake_case.
-    """
-
-    df = df.copy()
-
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.lower()
-        .str.replace(" ", "_", regex=False)
-        .str.replace("-", "_", regex=False)
-    )
-
-    return df
+    return df.sort_values(["city", "timestamp"]).reset_index(drop=True)
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean dataframe safely before feature engineering.
-    """
+def clean_raw_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().sort_values(["city", "timestamp"]).reset_index(drop=True)
 
-    logger.info("Cleaning data...")
+    numeric_columns = RAW_FEATURE_COLUMNS + [REFERENCE_COLUMN]
 
-    df = df.copy()
-    df = standardize_column_names(df)
-
-    df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce")
-    df["ingestion_time"] = pd.to_datetime(
-        df["ingestion_time"],
-        errors="coerce",
-        utc=True,
-    )
-
-    before = len(df)
-    df = df.dropna(subset=["event_time"])
-    logger.info("Dropped rows with missing event_time: %s", before - len(df))
-
-    numeric_columns = [
-        "latitude",
-        "longitude",
-        *AIR_QUALITY_COLUMNS,
-        *WEATHER_COLUMNS,
-    ]
+    missing = [col for col in numeric_columns if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required raw columns: {missing}")
 
     for col in numeric_columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df[numeric_columns] = df[numeric_columns].ffill().bfill()
+
+    for col, (lower, upper) in CLIP_BOUNDS.items():
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = df[col].clip(lower=lower, upper=upper)
 
-    before = len(df)
-    df = df.drop_duplicates(subset=["city", "event_time"], keep="last")
-    logger.info("Dropped duplicate rows: %s", before - len(df))
-
-    df = df.sort_values(["city", "event_time"]).reset_index(drop=True)
-
-    missing_counts = df.isna().sum()
-    missing_counts = missing_counts[missing_counts > 0]
-
-    if not missing_counts.empty:
-        logger.info("Missing values after cleaning:\n%s", missing_counts)
-
-    return df
+    return df.drop_duplicates(["city", "timestamp"], keep="last").reset_index(drop=True)
 
 
-# ============================================================
-# Feature engineering
-# ============================================================
-
-def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Safely divide two series.
+    Derive final 12 model features.
+
+    Critical:
+    Rolling windows are computed on recent past + future forecast together.
+    Only after this step do we filter future rows.
     """
 
-    denominator = denominator.replace(0, np.nan)
-    return numerator / denominator
+    df = df.copy().sort_values(["city", "timestamp"]).reset_index(drop=True)
 
+    logger.info("Deriving final 12 model features...")
 
-def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add time-based and cyclical features.
-    """
-
-    df = df.copy()
-
-    df["hour"] = df["event_time"].dt.hour
-    df["day"] = df["event_time"].dt.day
-    df["month"] = df["event_time"].dt.month
-    df["day_of_week"] = df["event_time"].dt.dayofweek
-    df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
-
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-
-    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
-
-    return df
-
-
-def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add deterministic weather and pollutant interaction features.
-    """
-
-    df = df.copy()
-
-    if {"temperature_2m", "relative_humidity_2m"}.issubset(df.columns):
-        df["temp_humidity_interaction"] = (
-            df["temperature_2m"] * df["relative_humidity_2m"]
-        )
-    else:
-        df["temp_humidity_interaction"] = np.nan
-
-    if {"wind_speed_10m", "wind_direction_10m"}.issubset(df.columns):
-        wind_direction_radians = np.deg2rad(df["wind_direction_10m"])
-        df["wind_x"] = df["wind_speed_10m"] * np.cos(wind_direction_radians)
-        df["wind_y"] = df["wind_speed_10m"] * np.sin(wind_direction_radians)
-    else:
-        df["wind_x"] = np.nan
-        df["wind_y"] = np.nan
-
-    if {"pm2_5", "pm10"}.issubset(df.columns):
-        df["pm_ratio"] = safe_divide(df["pm2_5"], df["pm10"])
-    else:
-        df["pm_ratio"] = np.nan
-
-    if {"nitrogen_dioxide", "ozone"}.issubset(df.columns):
-        df["no2_o3_ratio"] = safe_divide(df["nitrogen_dioxide"], df["ozone"])
-    else:
-        df["no2_o3_ratio"] = np.nan
-
-    return df
-
-
-def add_lag_and_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add lag and rolling features using only past timestamps.
-
-    Current us_aqi is the target.
-    Past us_aqi lag/rolling values are safe because they use previous rows only.
-    """
-
-    logger.info("Adding lag and rolling features...")
-
-    df = df.copy()
-    df = df.sort_values(["city", "event_time"]).reset_index(drop=True)
-
-    lag_config = {
-        "pm2_5": [1, 3, 6],
-        "pm10": [1, 3, 6],
-        "nitrogen_dioxide": [1],
-        "ozone": [1],
-        "temperature_2m": [1],
-        "relative_humidity_2m": [1],
-        "wind_speed_10m": [1],
-        "surface_pressure": [1],
-        "us_aqi": [1, 3, 6],
-    }
-
-    for col, lags in lag_config.items():
-        if col not in df.columns:
-            logger.warning("Skipping missing lag column: %s", col)
-            continue
-
-        for lag in lags:
-            df[f"{col}_lag_{lag}h"] = df.groupby("city")[col].shift(lag)
-
-    rolling_config = {
-        "us_aqi": {"mean": [3, 6, 12], "std": [6]},
-        "pm2_5": {"mean": [3, 6], "std": [6]},
-        "pm10": {"mean": [3, 6]},
-        "temperature_2m": {"mean": [6]},
-        "relative_humidity_2m": {"mean": [6]},
-        "wind_speed_10m": {"mean": [6]},
-    }
-
-    for col, operations in rolling_config.items():
-        if col not in df.columns:
-            logger.warning("Skipping missing rolling column: %s", col)
-            continue
-
-        shifted = df.groupby("city")[col].shift(1)
-
-        for operation, windows in operations.items():
-            for window in windows:
-                new_col = f"{col}_rolling_{operation}_{window}h"
-
-                if operation == "mean":
-                    df[new_col] = (
-                        shifted
-                        .groupby(df["city"])
-                        .rolling(window=window, min_periods=1)
-                        .mean()
-                        .reset_index(level=0, drop=True)
-                    )
-
-                elif operation == "std":
-                    df[new_col] = (
-                        shifted
-                        .groupby(df["city"])
-                        .rolling(window=window, min_periods=2)
-                        .std()
-                        .reset_index(level=0, drop=True)
-                    )
-
-    lag_rolling_cols = [
-        col for col in df.columns
-        if "_lag_" in col or "_rolling_" in col
-    ]
-
-    if lag_rolling_cols:
-        logger.info("Lag/rolling missing values:\n%s", df[lag_rolling_cols].isna().sum())
-
-    return df
-
-
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Run all feature engineering steps.
-    """
-
-    logger.info("Engineering features...")
-
-    df = add_time_features(df)
-    df = add_interaction_features(df)
-    df = add_lag_and_rolling_features(df)
-
-    return df
-
-
-# ============================================================
-# Validation and column ordering
-# ============================================================
-
-def validate_final_dataframe(df: pd.DataFrame) -> None:
-    """
-    Validate final dataframe before inserting into Hopsworks.
-    """
-
-    required_columns = [
-        "city",
-        "country",
-        "latitude",
-        "longitude",
-        "event_time",
-        "ingestion_time",
-        "source",
-        "us_aqi",
-    ]
-
-    missing = [col for col in required_columns if col not in df.columns]
-
-    if missing:
-        raise ValueError(f"Final dataframe missing required columns: {missing}")
-
-    if df.empty:
-        raise ValueError("Final dataframe is empty.")
-
-    logger.info("Final dataframe shape: %s", df.shape)
-
-
-def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reorder columns cleanly:
-    metadata → target → raw AQI → weather → engineered features.
-    """
-
-    engineered_columns = [
-        col for col in df.columns
-        if col not in METADATA_COLUMNS
-        and col not in AIR_QUALITY_COLUMNS
-        and col not in WEATHER_COLUMNS
-    ]
-
-    ordered_columns = (
-        METADATA_COLUMNS
-        + [TARGET_COLUMN]
-        + [col for col in AIR_QUALITY_COLUMNS if col != TARGET_COLUMN]
-        + WEATHER_COLUMNS
-        + engineered_columns
+    df["pm25_24h"] = df.groupby("city")["pm25"].transform(
+        lambda s: s.rolling(window=24, min_periods=1).mean()
+    )
+    df["pm10_24h"] = df.groupby("city")["pm10"].transform(
+        lambda s: s.rolling(window=24, min_periods=1).mean()
     )
 
-    ordered_columns = [col for col in ordered_columns if col in df.columns]
+    df["o3_8h"] = df.groupby("city")["ozone"].transform(
+        lambda s: s.rolling(window=8, min_periods=1).mean()
+    )
+    df["co_8h"] = df.groupby("city")["carbon_monoxide"].transform(
+        lambda s: s.rolling(window=8, min_periods=1).mean()
+    )
 
-    return df[ordered_columns]
+    df["no2_1h"] = df["nitrogen_dioxide"]
+
+    df["o3_8h_ppb"] = df["o3_8h"] * O3_TO_PPB
+    df["co_8h_ppm"] = df["co_8h"] * CO_TO_PPM
+    df["no2_1h_ppb"] = df["no2_1h"] * NO2_TO_PPB
+
+    return df
+
+
+def preprocess_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    required_columns = RAW_FEATURE_COLUMNS + DERIVED_DIAGNOSTIC_COLUMNS + MODEL_FEATURE_COLUMNS + [REFERENCE_COLUMN]
+
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise ValueError(f"Required columns missing after feature engineering: {missing}")
+
+    for col in required_columns:
+        if df[col].isna().sum() > 0:
+            df[col] = df[col].fillna(df[col].median())
+
+    for col, (lower, upper) in CLIP_BOUNDS.items():
+        if col in df.columns:
+            df[col] = df[col].clip(lower=lower, upper=upper)
+
+    df = df.dropna(subset=required_columns).reset_index(drop=True)
+
+    return df
+
+
+def build_forecast_feature_dataframe(cfg: dict[str, Any]) -> pd.DataFrame:
+    location = get_city_coordinates(cfg)
+    logger.info("Selected location: %s", location)
+
+    air_data = fetch_air_quality_data(location, cfg)
+    weather_data = fetch_weather_data(location, cfg)
+
+    air_df = air_quality_to_dataframe(air_data)
+    weather_df = weather_to_dataframe(weather_data)
+
+    raw_df = merge_dataframes(air_df, weather_df, location, cfg)
+    clean_df = clean_raw_data(raw_df)
+    feature_df = derive_features(clean_df)
+    feature_df = preprocess_features(feature_df)
+
+    # Save all rows as a useful debug/context file.
+    all_rows_path = REPORTS_DIR / "latest_forecast_context_raw_plus_derived.csv"
+    feature_df.to_csv(all_rows_path, index=False)
+    logger.info("Saved full past+future context features: %s", all_rows_path)
+
+    future_df = feature_df[feature_df["is_future"] == 1].copy()
+    future_df = future_df.sort_values("timestamp").head(cfg["prediction_hours"]).reset_index(drop=True)
+
+    if len(future_df) < cfg["prediction_hours"]:
+        raise ValueError(
+            f"Only {len(future_df)} future rows available. Need {cfg['prediction_hours']}. "
+            "Increase FORECAST_DAYS."
+        )
+
+    final_df = future_df[FORECAST_OUTPUT_COLUMNS].copy()
+
+    missing_feature_values = int(final_df[MODEL_FEATURE_COLUMNS].isna().sum().sum())
+    if missing_feature_values > 0:
+        raise ValueError(f"Model feature columns contain {missing_feature_values} missing values.")
+
+    logger.info("Final forecast shape: %s", final_df.shape)
+    logger.info("Future range: %s → %s", final_df["timestamp"].min(), final_df["timestamp"].max())
+    logger.info("Columns: %s", len(final_df.columns))
+
+    return final_df
+
+
+# ─────────────────────────────────────────────────────────────
+# Hopsworks / output
+# ─────────────────────────────────────────────────────────────
+
+def connect_to_hopsworks(cfg: dict[str, Any]):
+    project = hopsworks.login(
+        host=cfg["hopsworks_host"],
+        project=cfg["hopsworks_project"],
+        api_key_value=cfg["hopsworks_api_key"],
+        engine="python",
+    )
+    return project.get_feature_store()
 
 
 def prepare_for_hopsworks(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Prepare dataframe for Hopsworks insertion.
-
-    Hopsworks supports timestamp/date/bigint for event_time.
-    We keep event_time and ingestion_time as pandas datetime.
-    """
-
     df = df.copy()
-
-    df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce")
-    df["ingestion_time"] = pd.to_datetime(df["ingestion_time"], errors="coerce", utc=True)
-
-    # Hopsworks/Arrow can be sensitive to timezone-aware timestamps.
-    # Convert to timezone-naive UTC timestamps for stable insertion.
-    if getattr(df["event_time"].dt, "tz", None) is not None:
-        df["event_time"] = df["event_time"].dt.tz_convert("UTC").dt.tz_localize(None)
-
-    if getattr(df["ingestion_time"].dt, "tz", None) is not None:
-        df["ingestion_time"] = df["ingestion_time"].dt.tz_convert("UTC").dt.tz_localize(None)
-
-    # Replace inf/-inf with nulls
-    df = df.replace([np.inf, -np.inf], np.nan)
-
-    # Ensure text columns are strings
-    for col in ["city", "country", "source"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str)
-
-    return df
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["ingestion_timestamp"] = pd.to_datetime(df["ingestion_timestamp"], errors="coerce")
+    df["forecast_run_timestamp"] = pd.to_datetime(df["forecast_run_timestamp"], errors="coerce")
+    return df.dropna(subset=["timestamp", "ingestion_timestamp", "forecast_run_timestamp"])
 
 
-# ============================================================
-# Hopsworks writer
-# ============================================================
-
-def connect_to_hopsworks(config: dict[str, Any]):
-    """
-    Connect to Hopsworks and return the project feature store.
-    """
-
-    logger.info("Connecting to Hopsworks...")
-
-    project = hopsworks.login(
-        host=config["hopsworks_host"],
-        project=config["hopsworks_project"],
-        api_key_value=config["hopsworks_api_key"],
-        engine="python",
-    )
-
-    fs = project.get_feature_store()
-
-    logger.info("Connected to Hopsworks project: %s", project.name)
-    logger.info("Connected to Feature Store: %s", fs.name)
-
-    return fs
-
-
-def write_to_hopsworks(df: pd.DataFrame, config: dict[str, Any]) -> None:
-    """
-    Insert/upsert final dataframe into Hopsworks Feature Group.
-    """
-
-    logger.info("Writing features to Hopsworks Feature Group...")
-
-    fs = connect_to_hopsworks(config)
+def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
+    fs = connect_to_hopsworks(cfg)
 
     fg = fs.get_or_create_feature_group(
-        name=config["feature_group_name"],
-        version=config["feature_group_version"],
+        name=cfg["forecast_feature_group_name"],
+        version=cfg["forecast_feature_group_version"],
         description=(
-            "Hourly AQI, pollutant, weather, time, lag, and rolling features "
-            "for Hyderabad, Sindh, Pakistan from Open-Meteo."
+            "Forecast feature group for AQI model. Includes raw Open-Meteo "
+            "air-quality/weather features, 12 derived model features, and "
+            "Open-Meteo us_aqi reference for comparison."
         ),
-        primary_key=["city", "event_time"],
-        event_time="event_time",
-        online_enabled=config["online_enabled"],
-    )
-
-    logger.info(
-        "Feature Group ready: %s v%s",
-        config["feature_group_name"],
-        config["feature_group_version"],
+        primary_key=["city", "timestamp"],
+        event_time="timestamp",
+        online_enabled=cfg["online_enabled"],
     )
 
     df_to_insert = prepare_for_hopsworks(df)
 
-    logger.info("Rows to insert/upsert: %s", len(df_to_insert))
-    logger.info("Columns to insert/upsert: %s", len(df_to_insert.columns))
+    logger.info("Rows to insert: %s", len(df_to_insert))
+    logger.info("Columns to insert: %s", len(df_to_insert.columns))
 
-    # operation="upsert" prevents duplicates for same primary key when using HUDI.
-    # wait=True makes the script wait until the ingestion job finishes.
-    fg.insert(
-    df_to_insert,
-    operation="upsert",
-    write_options={"wait_for_job": True},
-)
+    # Avoid waiting for Hopsworks materialization logs, because the wait step can
+    # randomly fail with connection drops even when upload has started correctly.
+    fg.insert(df_to_insert, write_options={"wait_for_job": False})
 
-    logger.info("Hopsworks insert/upsert completed successfully.")
+    logger.info("Forecast features submitted to Hopsworks successfully.")
+    logger.info("Check Hopsworks UI for materialization job status.")
 
 
-# ============================================================
-# Main pipeline
-# ============================================================
+def save_local_copy(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
+    output_path = Path(cfg["local_forecast_output_path"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, index=False)
+    logger.info("Saved local forecast features: %s", output_path)
 
-def main() -> None:
-    """
-    Run complete feature pipeline.
-    """
 
-    logger.info("Starting Hyderabad AQI feature pipeline...")
+def run_feature_pipeline(upload: bool = True) -> pd.DataFrame:
+    cfg = load_config()
+    validate_config(cfg, upload=upload)
 
-    config = load_config()
-    validate_config(config)
+    df = build_forecast_feature_dataframe(cfg)
+    save_local_copy(df, cfg)
 
-    location = get_city_coordinates(config)
-
-    air_quality_data = fetch_air_quality_data(
-        latitude=location["latitude"],
-        longitude=location["longitude"],
-        config=config,
-    )
-
-    weather_data = fetch_weather_data(
-        latitude=location["latitude"],
-        longitude=location["longitude"],
-        config=config,
-    )
-
-    air_quality_df = air_quality_to_dataframe(air_quality_data)
-    weather_df = weather_to_dataframe(weather_data)
-
-    merged_df = merge_dataframes(
-        air_quality_df=air_quality_df,
-        weather_df=weather_df,
-        location=location,
-    )
-
-    clean_df = clean_data(merged_df)
-
-    final_df = engineer_features(clean_df)
-    final_df = reorder_columns(final_df)
-
-    validate_final_dataframe(final_df)
-
-    write_to_hopsworks(final_df, config)
+    if upload:
+        write_to_hopsworks(df, cfg)
+    else:
+        logger.info("Upload skipped because --no-upload was used.")
 
     logger.info("Feature pipeline completed successfully.")
+    return df
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-upload", action="store_true")
+    args = parser.parse_args()
+
+    run_feature_pipeline(upload=not args.no_upload)
 
 
 if __name__ == "__main__":

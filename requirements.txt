@@ -6,3 +6,7 @@ jupyter
 ipykernel
 databricks-sql-connector
 hopsworks[python]
+scikit-learn
+xgboost
+joblib
+matplotlib

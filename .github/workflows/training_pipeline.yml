@@ -1,0 +1,96 @@
+name: Nightly Backfill and Model Training
+
+on:
+  schedule:
+    # Runs daily at 02:30 UTC = 07:30 AM Pakistan time
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-backfill-training
+  cancel-in-progress: false
+
+jobs:
+  backfill-and-train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      # Location
+      CITY_NAME: Hyderabad
+      COUNTRY_CODE: PK
+      TIMEZONE: Asia/Karachi
+      LATITUDE: "25.3960"
+      LONGITUDE: "68.3578"
+
+      # Historical training data
+      BACKFILL_DAYS: "180"
+      BACKFILL_CHUNK_DAYS: "30"
+
+      # Hopsworks
+      HOPSWORKS_HOST: ${{ secrets.HOPSWORKS_HOST }}
+      HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
+      HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+      HOPSWORKS_ONLINE_ENABLED: "false"
+
+      # Training feature group
+      FEATURE_GROUP_NAME: aqi_openmeteo_12f_training_fg
+      FEATURE_GROUP_VERSION: "1"
+
+      # Best model registry
+      MODEL_NAME: aqi_openmeteo_12f_best_model
+      MODEL_OUTPUT_PATH: models/best_model.pkl
+      METRICS_OUTPUT_PATH: reports/model_metrics.csv
+      SELECTED_FEATURES_OUTPUT_PATH: reports/selected_features.csv
+      MODEL_METADATA_OUTPUT_PATH: reports/model_metadata.json
+      FEATURE_IMPORTANCE_OUTPUT_PATH: reports/feature_importance.csv
+
+      # Local backfill outputs
+      TRAINING_CACHE_PATH: data/openmeteo_12f_training_cache.pkl
+      TRAINING_CSV_PATH: data/openmeteo_12f_training_features.csv
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "hopsworks==4.7.*"
+
+      - name: Create output folders
+        run: |
+          mkdir -p reports models data
+
+      - name: Run 6-month backfill pipeline
+        run: |
+          python pipelines/backfill_pipeline.py
+
+      - name: Train 3 models and upload best model
+        run: |
+          python pipelines/training_pipeline.py
+
+      - name: Upload training artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-backfill-training-artifacts
+          path: |
+            data/openmeteo_12f_training_cache.pkl
+            data/openmeteo_12f_training_features.csv
+            models/best_model.pkl
+            reports/model_metrics.csv
+            reports/model_metadata.json
+            reports/selected_features.csv
+            reports/feature_importance.csv
+          if-no-files-found: warn

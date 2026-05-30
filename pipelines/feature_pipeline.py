@@ -1,31 +1,3 @@
-
-"""
-Feature Pipeline — Raw + 12 Derived Open-Meteo Features
-======================================================
-
-Purpose:
-- Fetch recent past + future Open-Meteo air-quality and weather forecast data.
-- Keep raw pollutant/weather features for EDA and dashboard analysis.
-- Derive the final 12 model features used for AQI prediction.
-- Keep Open-Meteo us_aqi as reference/target column, but never as an input feature.
-- Select next 72 future hours.
-- Save locally and optionally upload to Hopsworks.
-
-Final ML logic:
-    predicted_aqi(t) = f(12 derived pollutant/weather features at time t)
-
-Important:
-- Raw features are stored for EDA/reporting.
-- Model should use only MODEL_FEATURE_COLUMNS.
-- openmeteo_us_aqi_reference is target/reference, not input.
-- Rolling windows are calculated on recent past + future forecast together.
-- Only after rolling features are created do we filter the next 72 future rows.
-
-Run:
-    python pipelines/feature_pipeline.py --no-upload
-    python pipelines/feature_pipeline.py
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -36,11 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import hopsworks
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-import hopsworks
 
 
 # ─────────────────────────────────────────────────────────────
@@ -99,7 +71,7 @@ RAW_WEATHER_COLUMNS = [
 
 RAW_FEATURE_COLUMNS = RAW_AIR_QUALITY_COLUMNS + RAW_WEATHER_COLUMNS
 
-MODEL_FEATURE_COLUMNS = [
+BASE_MODEL_FEATURE_COLUMNS = [
     "pm25_24h",
     "pm10_24h",
     "o3_8h_ppb",
@@ -113,6 +85,20 @@ MODEL_FEATURE_COLUMNS = [
     "shortwave_radiation",
     "et0_fao_evapotranspiration",
 ]
+
+# Keep this list locked.
+# No month, month_sin, or month_cos for now because we are not training on full yearly data.
+TIME_FEATURE_COLUMNS = [
+    "hour",
+    "day_of_week",
+    "is_weekend",
+    "hour_sin",
+    "hour_cos",
+    "day_of_week_sin",
+    "day_of_week_cos",
+]
+
+MODEL_FEATURE_COLUMNS = BASE_MODEL_FEATURE_COLUMNS + TIME_FEATURE_COLUMNS
 
 DERIVED_DIAGNOSTIC_COLUMNS = [
     "o3_8h",
@@ -137,12 +123,21 @@ CLIP_BOUNDS = {
     "shortwave_radiation": (0, 1200),
     "et0_fao_evapotranspiration": (0, 20),
 
-    # Derived features
+    # Derived pollutant/weather model features
     "pm25_24h": (0, 500),
     "pm10_24h": (0, 600),
     "o3_8h_ppb": (0, 300),
     "co_8h_ppm": (0, 50),
     "no2_1h_ppb": (0, 2049),
+
+    # Time features
+    "hour": (0, 23),
+    "day_of_week": (0, 6),
+    "is_weekend": (0, 1),
+    "hour_sin": (-1, 1),
+    "hour_cos": (-1, 1),
+    "day_of_week_sin": (-1, 1),
+    "day_of_week_cos": (-1, 1),
 
     # Reference
     REFERENCE_COLUMN: (0, 500),
@@ -150,12 +145,11 @@ CLIP_BOUNDS = {
 
 # Keep output columns unique.
 # NOTE:
-# The 12 model features already include 7 raw weather columns:
+# The model features already include 7 raw weather columns:
 # temperature_2m, relative_humidity_2m, precipitation, windspeed_10m,
 # surface_pressure, shortwave_radiation, et0_fao_evapotranspiration.
 # If we add RAW_FEATURE_COLUMNS and MODEL_FEATURE_COLUMNS directly,
-# those weather columns appear twice. Hopsworks then sees duplicate
-# column names and can crash with: DataFrame object has no attribute dtype.
+# those weather columns appear twice. Hopsworks can crash on duplicate columns.
 FORECAST_OUTPUT_COLUMNS = list(dict.fromkeys([
     "city",
     "timestamp",
@@ -169,7 +163,7 @@ FORECAST_OUTPUT_COLUMNS = list(dict.fromkeys([
     # Intermediate derived features for EDA/debugging
     *DERIVED_DIAGNOSTIC_COLUMNS,
 
-    # Final model features
+    # Final model features: 12 base + 7 time = 19
     *MODEL_FEATURE_COLUMNS,
 
     # Reference/target from Open-Meteo; do not use as model input
@@ -206,9 +200,10 @@ def load_config() -> dict[str, Any]:
         "hopsworks_project": os.getenv("HOPSWORKS_PROJECT", os.getenv("HOPSWORKS_PROJECT_NAME")),
         "hopsworks_api_key": os.getenv("HOPSWORKS_API_KEY"),
 
+        # New default is 19f because schema changes after adding time features.
         "forecast_feature_group_name": os.getenv(
             "FORECAST_FEATURE_GROUP_NAME",
-            os.getenv("HOPSWORKS_FORECAST_FEATURE_GROUP", "aqi_openmeteo_12f_forecast_fg"),
+            os.getenv("HOPSWORKS_FORECAST_FEATURE_GROUP", "aqi_openmeteo_19f_forecast_fg"),
         ),
         "forecast_feature_group_version": int(
             os.getenv("FORECAST_FEATURE_GROUP_VERSION", os.getenv("HOPSWORKS_FORECAST_FEATURE_GROUP_VERSION", "1"))
@@ -219,6 +214,10 @@ def load_config() -> dict[str, Any]:
         "local_forecast_output_path": PROJECT_ROOT / os.getenv(
             "FORECAST_FEATURE_OUTPUT_PATH",
             "reports/latest_72h_forecast_features.csv",
+        ),
+        "local_context_output_path": PROJECT_ROOT / os.getenv(
+            "FORECAST_CONTEXT_OUTPUT_PATH",
+            "reports/latest_forecast_context_raw_plus_derived.csv",
         ),
     }
 
@@ -242,12 +241,21 @@ def validate_config(cfg: dict[str, Any], upload: bool) -> None:
         if missing:
             raise ValueError(f"Missing .env values for upload: {missing}")
 
+        fg_name = str(cfg["forecast_feature_group_name"]).lower()
+        if "12f" in fg_name:
+            raise ValueError(
+                "You are trying to upload 19-feature rows into a 12f forecast Feature Group. "
+                "Set FORECAST_FEATURE_GROUP_NAME=aqi_openmeteo_19f_forecast_fg in .env/GitHub Actions."
+            )
+
     logger.info("City: %s", cfg["city_name"])
     logger.info("Timezone: %s", cfg["timezone"])
     logger.info("Past days: %s", cfg["past_days"])
     logger.info("Forecast days: %s", cfg["forecast_days"])
     logger.info("Prediction hours: %s", cfg["prediction_hours"])
     logger.info("Raw feature count: %s", len(RAW_FEATURE_COLUMNS))
+    logger.info("Base model feature count: %s", len(BASE_MODEL_FEATURE_COLUMNS))
+    logger.info("Time feature count: %s", len(TIME_FEATURE_COLUMNS))
     logger.info("Model feature count: %s", len(MODEL_FEATURE_COLUMNS))
     logger.info("Total output columns: %s", len(FORECAST_OUTPUT_COLUMNS))
     logger.info("Forecast FG: %s v%s", cfg["forecast_feature_group_name"], cfg["forecast_feature_group_version"])
@@ -328,14 +336,14 @@ def fetch_air_quality_data(location: dict[str, Any], cfg: dict[str, Any]) -> dic
         "timezone": cfg["timezone"],
         "past_days": cfg["past_days"],
         "forecast_days": cfg["forecast_days"],
-        "hourly": [
+        "hourly": ",".join([
             "pm2_5",
             "pm10",
             "carbon_monoxide",
             "nitrogen_dioxide",
             "ozone",
             "us_aqi",
-        ],
+        ]),
     }
 
     logger.info("Fetching Open-Meteo air-quality forecast data...")
@@ -349,7 +357,7 @@ def fetch_weather_data(location: dict[str, Any], cfg: dict[str, Any]) -> dict[st
         "timezone": cfg["timezone"],
         "past_days": cfg["past_days"],
         "forecast_days": cfg["forecast_days"],
-        "hourly": [
+        "hourly": ",".join([
             "temperature_2m",
             "relative_humidity_2m",
             "precipitation",
@@ -357,7 +365,7 @@ def fetch_weather_data(location: dict[str, Any], cfg: dict[str, Any]) -> dict[st
             "surface_pressure",
             "shortwave_radiation",
             "et0_fao_evapotranspiration",
-        ],
+        ]),
     }
 
     logger.info("Fetching Open-Meteo weather forecast data...")
@@ -413,7 +421,7 @@ def merge_dataframes(
     df["longitude"] = location["longitude"]
     df["ingestion_timestamp"] = run_time
     df["forecast_run_timestamp"] = run_time
-    df["is_future"] = (df["timestamp"] > current_local_hour).astype(int)
+    df["is_future"] = (df["timestamp"] > current_local_hour).astype("int64")
 
     logger.info("Current local hour: %s", current_local_hour)
     logger.info("Merged forecast shape before features: %s", df.shape)
@@ -442,9 +450,34 @@ def clean_raw_data(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates(["city", "timestamp"], keep="last").reset_index(drop=True)
 
 
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add safe short-term time features.
+
+    Locked rule:
+    - We use hour/day-of-week/weekend features only.
+    - We do NOT use month, month_sin, or month_cos.
+    """
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"]).copy()
+
+    df["hour"] = df["timestamp"].dt.hour.astype("int64")
+    df["day_of_week"] = df["timestamp"].dt.dayofweek.astype("int64")
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype("int64")
+
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24).astype("float64")
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24).astype("float64")
+    df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7).astype("float64")
+    df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7).astype("float64")
+
+    return df
+
+
 def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Derive final 12 model features.
+    Derive final 19 model features.
 
     Critical:
     Rolling windows are computed on recent past + future forecast together.
@@ -453,7 +486,7 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy().sort_values(["city", "timestamp"]).reset_index(drop=True)
 
-    logger.info("Deriving final 12 model features...")
+    logger.info("Deriving final 19 model features...")
 
     df["pm25_24h"] = df.groupby("city")["pm25"].transform(
         lambda s: s.rolling(window=24, min_periods=1).mean()
@@ -461,43 +494,87 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     df["pm10_24h"] = df.groupby("city")["pm10"].transform(
         lambda s: s.rolling(window=24, min_periods=1).mean()
     )
-
     df["o3_8h"] = df.groupby("city")["ozone"].transform(
         lambda s: s.rolling(window=8, min_periods=1).mean()
     )
     df["co_8h"] = df.groupby("city")["carbon_monoxide"].transform(
         lambda s: s.rolling(window=8, min_periods=1).mean()
     )
-
     df["no2_1h"] = df["nitrogen_dioxide"]
 
     df["o3_8h_ppb"] = df["o3_8h"] * O3_TO_PPB
     df["co_8h_ppm"] = df["co_8h"] * CO_TO_PPM
     df["no2_1h_ppb"] = df["no2_1h"] * NO2_TO_PPB
 
-    return df
-
-
-def preprocess_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    required_columns = RAW_FEATURE_COLUMNS + DERIVED_DIAGNOSTIC_COLUMNS + MODEL_FEATURE_COLUMNS + [REFERENCE_COLUMN]
-
-    missing = [col for col in required_columns if col not in df.columns]
-    if missing:
-        raise ValueError(f"Required columns missing after feature engineering: {missing}")
-
-    for col in required_columns:
-        if df[col].isna().sum() > 0:
-            df[col] = df[col].fillna(df[col].median())
+    df = add_time_features(df)
 
     for col, (lower, upper) in CLIP_BOUNDS.items():
         if col in df.columns:
-            df[col] = df[col].clip(lower=lower, upper=upper)
-
-    df = df.dropna(subset=required_columns).reset_index(drop=True)
+            df[col] = pd.to_numeric(df[col], errors="coerce").clip(lower=lower, upper=upper)
 
     return df
+
+
+# ─────────────────────────────────────────────────────────────
+# Validation and output shaping
+# ─────────────────────────────────────────────────────────────
+
+def validate_forecast_dataframe(df: pd.DataFrame) -> None:
+    if df.empty:
+        raise ValueError("Final forecast dataframe is empty.")
+
+    missing = [col for col in FORECAST_OUTPUT_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Final forecast dataframe missing columns: {missing}")
+
+    feature_nulls = df[MODEL_FEATURE_COLUMNS].isna().sum()
+    bad_feature_nulls = feature_nulls[feature_nulls > 0]
+    if not bad_feature_nulls.empty:
+        raise ValueError(f"Model features contain nulls:\n{bad_feature_nulls}")
+
+    if df.duplicated(["city", "timestamp"]).any():
+        raise ValueError("Duplicate city + timestamp rows found.")
+
+    if len(MODEL_FEATURE_COLUMNS) != 19:
+        raise ValueError(f"Expected 19 model features, got {len(MODEL_FEATURE_COLUMNS)}.")
+
+    blocked_features = {"month", "month_sin", "month_cos"}
+    leaked = blocked_features.intersection(set(df.columns))
+    if leaked:
+        raise ValueError(f"Month features are blocked for now but were found: {sorted(leaked)}")
+
+    if TARGET_COLUMN in MODEL_FEATURE_COLUMNS or REFERENCE_COLUMN in MODEL_FEATURE_COLUMNS:
+        raise ValueError("Target/reference column leaked into MODEL_FEATURE_COLUMNS.")
+
+    logger.info("Forecast dataframe validation passed.")
+
+
+def select_forecast_rows(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
+    future_df = (
+        df[df["is_future"] == 1]
+        .sort_values(["city", "timestamp"])
+        .head(cfg["prediction_hours"])
+        .copy()
+    )
+
+    if len(future_df) < cfg["prediction_hours"]:
+        logger.warning(
+            "Only %s future rows available, expected %s.",
+            len(future_df),
+            cfg["prediction_hours"],
+        )
+
+    if future_df.empty:
+        raise ValueError("No future rows available for forecast upload.")
+
+    final_df = future_df[FORECAST_OUTPUT_COLUMNS].copy()
+    validate_forecast_dataframe(final_df)
+
+    logger.info("Final forecast shape: %s", final_df.shape)
+    logger.info("Future range: %s → %s", final_df["timestamp"].min(), final_df["timestamp"].max())
+    logger.info("Columns: %s", len(final_df.columns))
+
+    return final_df
 
 
 def build_forecast_feature_dataframe(cfg: dict[str, Any]) -> pd.DataFrame:
@@ -510,40 +587,20 @@ def build_forecast_feature_dataframe(cfg: dict[str, Any]) -> pd.DataFrame:
     air_df = air_quality_to_dataframe(air_data)
     weather_df = weather_to_dataframe(weather_data)
 
-    raw_df = merge_dataframes(air_df, weather_df, location, cfg)
-    clean_df = clean_raw_data(raw_df)
+    merged_df = merge_dataframes(air_df, weather_df, location, cfg)
+    clean_df = clean_raw_data(merged_df)
     feature_df = derive_features(clean_df)
-    feature_df = preprocess_features(feature_df)
 
-    # Save all rows as a useful debug/context file.
-    all_rows_path = REPORTS_DIR / "latest_forecast_context_raw_plus_derived.csv"
-    feature_df.to_csv(all_rows_path, index=False)
-    logger.info("Saved full past+future context features: %s", all_rows_path)
+    context_path = Path(cfg["local_context_output_path"])
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    feature_df.to_csv(context_path, index=False)
+    logger.info("Saved full past+future context features: %s", context_path)
 
-    future_df = feature_df[feature_df["is_future"] == 1].copy()
-    future_df = future_df.sort_values("timestamp").head(cfg["prediction_hours"]).reset_index(drop=True)
-
-    if len(future_df) < cfg["prediction_hours"]:
-        raise ValueError(
-            f"Only {len(future_df)} future rows available. Need {cfg['prediction_hours']}. "
-            "Increase FORECAST_DAYS."
-        )
-
-    final_df = future_df[FORECAST_OUTPUT_COLUMNS].copy()
-
-    missing_feature_values = int(final_df[MODEL_FEATURE_COLUMNS].isna().sum().sum())
-    if missing_feature_values > 0:
-        raise ValueError(f"Model feature columns contain {missing_feature_values} missing values.")
-
-    logger.info("Final forecast shape: %s", final_df.shape)
-    logger.info("Future range: %s → %s", final_df["timestamp"].min(), final_df["timestamp"].max())
-    logger.info("Columns: %s", len(final_df.columns))
-
-    return final_df
+    return select_forecast_rows(feature_df, cfg)
 
 
 # ─────────────────────────────────────────────────────────────
-# Hopsworks / output
+# Hopsworks
 # ─────────────────────────────────────────────────────────────
 
 def connect_to_hopsworks(cfg: dict[str, Any]):
@@ -558,10 +615,30 @@ def connect_to_hopsworks(cfg: dict[str, Any]):
 
 def prepare_for_hopsworks(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    df["city"] = df["city"].astype(str)
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["ingestion_timestamp"] = pd.to_datetime(df["ingestion_timestamp"], errors="coerce")
     df["forecast_run_timestamp"] = pd.to_datetime(df["forecast_run_timestamp"], errors="coerce")
-    return df.dropna(subset=["timestamp", "ingestion_timestamp", "forecast_run_timestamp"])
+    df = df.dropna(subset=["timestamp", "ingestion_timestamp", "forecast_run_timestamp"])
+
+    int_columns = ["is_future", "hour", "day_of_week", "is_weekend"]
+    float_columns = [
+        col for col in df.columns
+        if col not in {"city", "timestamp", "ingestion_timestamp", "forecast_run_timestamp", *int_columns}
+    ]
+
+    for col in float_columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+
+    for col in int_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("int64")
+
+    if REFERENCE_COLUMN in df.columns:
+        df[REFERENCE_COLUMN] = pd.to_numeric(df[REFERENCE_COLUMN], errors="coerce").astype("float64")
+
+    return df
 
 
 def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
@@ -572,8 +649,9 @@ def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
         version=cfg["forecast_feature_group_version"],
         description=(
             "Forecast feature group for AQI model. Includes raw Open-Meteo "
-            "air-quality/weather features, 12 derived model features, and "
-            "Open-Meteo us_aqi reference for comparison."
+            "air-quality/weather features, 12 pollutant/weather model features, "
+            "7 time-based model features, and Open-Meteo us_aqi reference for comparison. "
+            "No month features are included."
         ),
         primary_key=["city", "timestamp"],
         event_time="timestamp",
@@ -584,16 +662,10 @@ def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
 
     logger.info("Rows to insert: %s", len(df_to_insert))
     logger.info("Columns to insert: %s", len(df_to_insert.columns))
+    logger.info("Insert dataframe dtypes:\n%s", df_to_insert.dtypes)
 
-# Fix Hopsworks schema type mismatch
-    if "openmeteo_us_aqi_reference" in df_to_insert.columns:
-        df_to_insert["openmeteo_us_aqi_reference"] = pd.to_numeric(
-            df_to_insert["openmeteo_us_aqi_reference"],
-            errors="coerce"
-        ).astype("float64")        
     # Avoid waiting for Hopsworks materialization logs, because the wait step can
     # randomly fail with connection drops even when upload has started correctly.
-    logging.info("Insert dataframe dtypes:\n%s", df_to_insert.dtypes)
     fg.insert(df_to_insert, write_options={"wait_for_job": False})
 
     logger.info("Forecast features submitted to Hopsworks successfully.")

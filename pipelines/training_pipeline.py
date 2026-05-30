@@ -28,6 +28,10 @@ except ImportError:
     XGBRegressor = None
 
 
+# ============================================================
+# Logging and paths
+# ============================================================
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -35,12 +39,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = PROJECT_ROOT / ".env"
 MODELS_DIR = PROJECT_ROOT / "models"
 REPORTS_DIR = PROJECT_ROOT / "reports"
+
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ============================================================
+# Constants
+# ============================================================
+
 TARGET_COLUMN = "us_aqi"
 
-MODEL_FEATURE_COLUMNS = [
+BASE_MODEL_FEATURE_COLUMNS = [
     "pm25_24h",
     "pm10_24h",
     "o3_8h_ppb",
@@ -55,6 +65,25 @@ MODEL_FEATURE_COLUMNS = [
     "et0_fao_evapotranspiration",
 ]
 
+# No month/month_sin/month_cos for now because we are not training on enough yearly data.
+TIME_FEATURE_COLUMNS = [
+    "hour",
+    "day_of_week",
+    "is_weekend",
+    "hour_sin",
+    "hour_cos",
+    "day_of_week_sin",
+    "day_of_week_cos",
+]
+
+MODEL_FEATURE_COLUMNS = BASE_MODEL_FEATURE_COLUMNS + TIME_FEATURE_COLUMNS
+
+EXPECTED_FEATURE_COUNT = 19
+
+
+# ============================================================
+# Config
+# ============================================================
 
 def load_config() -> dict[str, Any]:
     load_dotenv(ENV_PATH)
@@ -65,12 +94,12 @@ def load_config() -> dict[str, Any]:
         "hopsworks_api_key": os.getenv("HOPSWORKS_API_KEY"),
         "feature_group_name": os.getenv(
             "FEATURE_GROUP_NAME",
-            os.getenv("HOPSWORKS_FEATURE_GROUP", "aqi_openmeteo_12f_training_fg"),
+            os.getenv("HOPSWORKS_FEATURE_GROUP", "aqi_openmeteo_19f_training_fg"),
         ),
         "feature_group_version": int(
             os.getenv("FEATURE_GROUP_VERSION", os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "1"))
         ),
-        "model_name": os.getenv("MODEL_NAME", "aqi_openmeteo_12f_best_model"),
+        "model_name": os.getenv("MODEL_NAME", "aqi_openmeteo_19f_best_model"),
         "model_output_path": PROJECT_ROOT / os.getenv("MODEL_OUTPUT_PATH", "models/best_model.pkl"),
         "metrics_output_path": PROJECT_ROOT / os.getenv("METRICS_OUTPUT_PATH", "reports/model_metrics.csv"),
         "metadata_output_path": PROJECT_ROOT / os.getenv("MODEL_METADATA_OUTPUT_PATH", "reports/model_metadata.json"),
@@ -98,11 +127,35 @@ def validate_config(cfg: dict[str, Any], register_model: bool) -> None:
     if missing:
         raise ValueError(f"Missing .env values: {missing}")
 
+    if len(MODEL_FEATURE_COLUMNS) != EXPECTED_FEATURE_COUNT:
+        raise ValueError(
+            f"Expected {EXPECTED_FEATURE_COUNT} model features, got {len(MODEL_FEATURE_COLUMNS)}."
+        )
+
+    # Safety guard: this 19-feature pipeline should not train against the old 12f group/model.
+    if "12f" in str(cfg["feature_group_name"]).lower():
+        raise ValueError(
+            "This is the 19-feature training pipeline, but FEATURE_GROUP_NAME looks like an old 12f group. "
+            "Set FEATURE_GROUP_NAME=aqi_openmeteo_19f_training_fg."
+        )
+
+    if register_model and "12f" in str(cfg["model_name"]).lower():
+        raise ValueError(
+            "This is the 19-feature training pipeline, but MODEL_NAME looks like an old 12f model. "
+            "Set MODEL_NAME=aqi_openmeteo_19f_best_model."
+        )
+
     logger.info("Hopsworks project: %s", cfg["hopsworks_project"])
     logger.info("Training FG: %s v%s", cfg["feature_group_name"], cfg["feature_group_version"])
     logger.info("Model registry name: %s", cfg["model_name"])
-    logger.info("Feature count: %s", len(MODEL_FEATURE_COLUMNS))
+    logger.info("Base feature count: %s", len(BASE_MODEL_FEATURE_COLUMNS))
+    logger.info("Time feature count: %s", len(TIME_FEATURE_COLUMNS))
+    logger.info("Total model feature count: %s", len(MODEL_FEATURE_COLUMNS))
 
+
+# ============================================================
+# Hopsworks IO
+# ============================================================
 
 def connect_to_hopsworks(cfg: dict[str, Any]):
     return hopsworks.login(
@@ -124,7 +177,7 @@ def read_training_data_from_hopsworks(cfg: dict[str, Any]) -> pd.DataFrame:
 
     selected_columns = ["city", "timestamp", *MODEL_FEATURE_COLUMNS, TARGET_COLUMN]
 
-    logger.info("Reading training features from Hopsworks...")
+    logger.info("Reading 19-feature training data from Hopsworks.")
     query = fg.select(selected_columns)
 
     try:
@@ -140,19 +193,34 @@ def read_training_data_from_hopsworks(cfg: dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+# ============================================================
+# Data preparation
+# ============================================================
+
 def prepare_training_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     required_columns = ["city", "timestamp", *MODEL_FEATURE_COLUMNS, TARGET_COLUMN]
     missing = [col for col in required_columns if col not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns from Hopsworks data: {missing}")
+        raise ValueError(
+            "Missing required columns from Hopsworks data: "
+            f"{missing}. Make sure the 19-feature backfill pipeline has uploaded "
+            "aqi_openmeteo_19f_training_fg first."
+        )
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).copy()
 
     for col in MODEL_FEATURE_COLUMNS + [TARGET_COLUMN]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Strict dtype cleanup for time features.
+    for col in ["hour", "day_of_week", "is_weekend"]:
+        df[col] = df[col].round().astype("Int64")
+
+    for col in ["hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos"]:
+        df[col] = df[col].astype("float64")
 
     before_rows = len(df)
     df = (
@@ -174,6 +242,10 @@ def prepare_training_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 def time_based_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df.sort_values("timestamp").reset_index(drop=True)
     split_index = int(len(df) * 0.80)
+
+    if split_index <= 0 or split_index >= len(df):
+        raise ValueError("Invalid train/test split. Need more training rows.")
+
     train_df = df.iloc[:split_index].copy()
     test_df = df.iloc[split_index:].copy()
 
@@ -181,6 +253,10 @@ def time_based_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     logger.info("Test rows : %s | %s to %s", len(test_df), test_df["timestamp"].min(), test_df["timestamp"].max())
     return train_df, test_df
 
+
+# ============================================================
+# Models
+# ============================================================
 
 def make_preprocessor(scale: bool) -> ColumnTransformer:
     steps = [("imputer", SimpleImputer(strategy="median"))]
@@ -263,11 +339,11 @@ def train_and_evaluate_models(train_df: pd.DataFrame, test_df: pd.DataFrame):
     trained_models = {}
 
     print("\n" + "=" * 80)
-    print("Training and Evaluating Models")
+    print("Training and Evaluating 19-Feature Models")
     print("=" * 80)
 
     for model_name, model in models.items():
-        logger.info("Training %s...", model_name)
+        logger.info("Training %s.", model_name)
         model.fit(X_train, y_train)
 
         train_pred = model.predict(X_train)
@@ -323,7 +399,7 @@ def get_feature_importance(best_model: Pipeline, best_model_name: str) -> pd.Dat
     if hasattr(fitted_model, "feature_importances_"):
         importance = fitted_model.feature_importances_
     elif hasattr(fitted_model, "coef_"):
-        importance = np.abs(fitted_model.coef_)
+        importance = np.abs(np.ravel(fitted_model.coef_))
     else:
         importance = np.zeros(len(MODEL_FEATURE_COLUMNS))
 
@@ -339,6 +415,10 @@ def get_feature_importance(best_model: Pipeline, best_model_name: str) -> pd.Dat
         .reset_index(drop=True)
     )
 
+
+# ============================================================
+# Artifact saving and model registry
+# ============================================================
 
 def save_local_artifacts(
     best_model: Pipeline,
@@ -385,6 +465,9 @@ def save_local_artifacts(
         "target_column": TARGET_COLUMN,
         "feature_columns": MODEL_FEATURE_COLUMNS,
         "feature_count": len(MODEL_FEATURE_COLUMNS),
+        "base_feature_count": len(BASE_MODEL_FEATURE_COLUMNS),
+        "time_feature_count": len(TIME_FEATURE_COLUMNS),
+        "time_features": TIME_FEATURE_COLUMNS,
         "training_rows": int(len(training_df)),
         "training_start": str(training_df["timestamp"].min()),
         "training_end": str(training_df["timestamp"].max()),
@@ -396,7 +479,8 @@ def save_local_artifacts(
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "description": (
             "Best AQI model selected from Ridge Regression, Random Forest, and XGBoost. "
-            "Model uses 12 derived Open-Meteo pollutant/weather features and predicts Open-Meteo us_aqi."
+            "Model uses 12 Open-Meteo pollutant/weather features plus 7 time features. "
+            "No month-based features are used."
         ),
     }
 
@@ -430,7 +514,7 @@ def register_model_to_hopsworks(
         "feature_count": float(len(MODEL_FEATURE_COLUMNS)),
     }
 
-    logger.info("Registering best model to Hopsworks Model Registry...")
+    logger.info("Registering best 19-feature model to Hopsworks Model Registry.")
     logger.info("Model registry name: %s", cfg["model_name"])
     logger.info("Winning algorithm: %s", best_model_name)
 
@@ -452,7 +536,8 @@ def register_model_to_hopsworks(
             metrics=registry_metrics,
             description=(
                 "Best AQI model selected from Ridge Regression, Random Forest, and XGBoost. "
-                "Uses 12 derived Open-Meteo features to predict us_aqi."
+                "Uses 19 features: 12 Open-Meteo pollutant/weather features plus 7 time features. "
+                "No month features."
             ),
         )
         saved_model = model_obj.save(str(temp_dir))
@@ -460,12 +545,17 @@ def register_model_to_hopsworks(
     logger.info("Model registered successfully: %s", saved_model)
 
 
+# ============================================================
+# Pipeline entrypoint
+# ============================================================
+
 def run_training_pipeline(register_model: bool = True) -> pd.DataFrame:
     cfg = load_config()
     validate_config(cfg, register_model=register_model)
 
     print("\n" + "=" * 80)
-    print("AQI Training Pipeline — 12 Derived Open-Meteo Features")
+    print("AQI Training Pipeline — 19 Features")
+    print("12 Open-Meteo features + 7 time features | no month features")
     print("=" * 80)
 
     raw_df = read_training_data_from_hopsworks(cfg)

@@ -39,8 +39,14 @@ GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
 TARGET_COLUMN = "us_aqi"
 
+# Backward-compatible path used by training_pipeline.py imports.
+LOCAL_CACHE_PATH = DATA_DIR / os.getenv(
+    "TRAINING_CACHE_PATH",
+    "openmeteo_19f_training_cache.pkl",
+)
+
 # Gas conversion constants.
-# Open-Meteo gas values are in µg/m³.
+# Open-Meteo gas values are usually returned in µg/m³.
 O3_TO_PPB = 24.465 / 48
 NO2_TO_PPB = 24.465 / 46
 CO_TO_PPM = 24.465 / (28 * 1000)
@@ -70,7 +76,7 @@ RAW_WEATHER_COLUMNS = [
 
 RAW_FEATURE_COLUMNS = RAW_AIR_QUALITY_COLUMNS + RAW_WEATHER_COLUMNS
 
-MODEL_FEATURE_COLUMNS = [
+BASE_MODEL_FEATURE_COLUMNS = [
     "pm25_24h",
     "pm10_24h",
     "o3_8h_ppb",
@@ -84,6 +90,19 @@ MODEL_FEATURE_COLUMNS = [
     "shortwave_radiation",
     "et0_fao_evapotranspiration",
 ]
+
+# IMPORTANT: No month/month_sin/month_cos for now.
+TIME_FEATURE_COLUMNS = [
+    "hour",
+    "day_of_week",
+    "is_weekend",
+    "hour_sin",
+    "hour_cos",
+    "day_of_week_sin",
+    "day_of_week_cos",
+]
+
+MODEL_FEATURE_COLUMNS = BASE_MODEL_FEATURE_COLUMNS + TIME_FEATURE_COLUMNS
 
 DERIVED_DIAGNOSTIC_COLUMNS = [
     "o3_8h",
@@ -108,33 +127,41 @@ CLIP_BOUNDS = {
     "shortwave_radiation": (0, 1200),
     "et0_fao_evapotranspiration": (0, 20),
 
-    # Derived features
+    # Derived base model features
     "pm25_24h": (0, 500),
     "pm10_24h": (0, 600),
     "o3_8h_ppb": (0, 300),
     "co_8h_ppm": (0, 50),
     "no2_1h_ppb": (0, 2049),
 
+    # Time features
+    "hour": (0, 23),
+    "day_of_week": (0, 6),
+    "is_weekend": (0, 1),
+    "hour_sin": (-1, 1),
+    "hour_cos": (-1, 1),
+    "day_of_week_sin": (-1, 1),
+    "day_of_week_cos": (-1, 1),
+
     # Target
     TARGET_COLUMN: (0, 500),
 }
 
-# Keep output columns unique.
 TRAINING_OUTPUT_COLUMNS = list(dict.fromkeys([
     "city",
     "timestamp",
     "ingestion_timestamp",
 
-    # Raw features for EDA/dashboard/debugging
+    # Raw features for EDA/debugging
     *RAW_FEATURE_COLUMNS,
 
     # Intermediate derived features for EDA/debugging
     *DERIVED_DIAGNOSTIC_COLUMNS,
 
-    # Final model features
+    # Final model features: 12 base + 7 time = 19
     *MODEL_FEATURE_COLUMNS,
 
-    # ML target from Open-Meteo
+    # ML target from Open-Meteo historical AQI
     TARGET_COLUMN,
 ]))
 
@@ -160,7 +187,7 @@ def load_config() -> dict[str, Any]:
         "latitude": os.getenv("LATITUDE"),
         "longitude": os.getenv("LONGITUDE"),
 
-        # 6 months default = 180 days
+        # Keep this controlled through .env/GitHub env.
         "backfill_days": int(os.getenv("BACKFILL_DAYS", "180")),
         "backfill_chunk_days": int(os.getenv("BACKFILL_CHUNK_DAYS", "30")),
 
@@ -168,9 +195,11 @@ def load_config() -> dict[str, Any]:
         "hopsworks_project": os.getenv("HOPSWORKS_PROJECT", os.getenv("HOPSWORKS_PROJECT_NAME")),
         "hopsworks_api_key": os.getenv("HOPSWORKS_API_KEY"),
 
+        # NEW training FG for 19-feature schema.
+        # Do not reuse the old aqi_openmeteo_12f_training_fg because Hopsworks schema is strict.
         "feature_group_name": os.getenv(
             "FEATURE_GROUP_NAME",
-            os.getenv("HOPSWORKS_FEATURE_GROUP", "aqi_openmeteo_12f_training_fg"),
+            os.getenv("HOPSWORKS_FEATURE_GROUP", "aqi_openmeteo_19f_training_fg"),
         ),
         "feature_group_version": int(
             os.getenv("FEATURE_GROUP_VERSION", os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "1"))
@@ -180,11 +209,11 @@ def load_config() -> dict[str, Any]:
 
         "training_cache_path": PROJECT_ROOT / os.getenv(
             "TRAINING_CACHE_PATH",
-            "data/openmeteo_12f_training_cache.pkl",
+            "data/openmeteo_19f_training_cache.pkl",
         ),
         "training_csv_path": PROJECT_ROOT / os.getenv(
             "TRAINING_CSV_PATH",
-            "data/openmeteo_12f_training_features.csv",
+            "data/openmeteo_19f_training_features.csv",
         ),
     }
 
@@ -208,11 +237,20 @@ def validate_config(cfg: dict[str, Any], upload: bool) -> None:
         if missing:
             raise ValueError(f"Missing .env values for upload: {missing}")
 
+        fg_name = str(cfg["feature_group_name"]).lower()
+        if "12f" in fg_name:
+            raise ValueError(
+                "You are trying to upload 19-feature rows into a 12f training Feature Group. "
+                "Set FEATURE_GROUP_NAME=aqi_openmeteo_19f_training_fg in .env/GitHub Actions."
+            )
+
     logger.info("City: %s", cfg["city_name"])
     logger.info("Timezone: %s", cfg["timezone"])
     logger.info("Backfill days: %s", cfg["backfill_days"])
     logger.info("Backfill chunk days: %s", cfg["backfill_chunk_days"])
     logger.info("Raw feature count: %s", len(RAW_FEATURE_COLUMNS))
+    logger.info("Base model feature count: %s", len(BASE_MODEL_FEATURE_COLUMNS))
+    logger.info("Time feature count: %s", len(TIME_FEATURE_COLUMNS))
     logger.info("Model feature count: %s", len(MODEL_FEATURE_COLUMNS))
     logger.info("Total output columns: %s", len(TRAINING_OUTPUT_COLUMNS))
     logger.info("Training FG: %s v%s", cfg["feature_group_name"], cfg["feature_group_version"])
@@ -442,7 +480,10 @@ def clean_raw_data(df: pd.DataFrame) -> pd.DataFrame:
     for col in numeric_columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df[numeric_columns] = df[numeric_columns].ffill().bfill()
+    # Fill short API gaps in historical data.
+    df[numeric_columns] = df.groupby("city", group_keys=False)[numeric_columns].apply(
+        lambda group: group.ffill().bfill()
+    )
 
     for col, (lower, upper) in CLIP_BOUNDS.items():
         if col in df.columns:
@@ -453,12 +494,12 @@ def clean_raw_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Derive final 12 model features from raw Open-Meteo pollutant/weather data.
+    Derive final base model features from raw Open-Meteo pollutant/weather data.
     """
 
     df = df.copy().sort_values(["city", "timestamp"]).reset_index(drop=True)
 
-    logger.info("Deriving final 12 model features...")
+    logger.info("Deriving final 12 base model features...")
 
     df["pm25_24h"] = df.groupby("city")["pm25"].transform(
         lambda s: s.rolling(window=24, min_periods=1).mean()
@@ -483,6 +524,31 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_time_features(df: pd.DataFrame, timestamp_col: str = "timestamp") -> pd.DataFrame:
+    """
+    Add forecast-safe time features.
+
+    No month/month_sin/month_cos are included because the current dataset is not
+    large enough for stable yearly seasonality learning.
+    """
+    df = df.copy()
+
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df = df.dropna(subset=[timestamp_col]).copy()
+
+    df["hour"] = df[timestamp_col].dt.hour.astype("int64")
+    df["day_of_week"] = df[timestamp_col].dt.dayofweek.astype("int64")
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype("int64")
+
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24).astype("float64")
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24).astype("float64")
+
+    df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7).astype("float64")
+    df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7).astype("float64")
+
+    return df
+
+
 def preprocess_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -493,8 +559,12 @@ def preprocess_features(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Required columns missing after feature engineering: {missing}")
 
     for col in required_columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
         if df[col].isna().sum() > 0:
-            df[col] = df[col].fillna(df[col].median())
+            median_value = df[col].median()
+            if pd.isna(median_value):
+                median_value = 0.0
+            df[col] = df[col].fillna(median_value)
 
     for col, (lower, upper) in CLIP_BOUNDS.items():
         if col in df.columns:
@@ -509,6 +579,7 @@ def build_training_dataframe(cfg: dict[str, Any]) -> pd.DataFrame:
     raw_df = fetch_historical_raw_dataframe(cfg)
     clean_df = clean_raw_data(raw_df)
     feature_df = derive_features(clean_df)
+    feature_df = add_time_features(feature_df, timestamp_col="timestamp")
     feature_df = preprocess_features(feature_df)
 
     final_df = feature_df[TRAINING_OUTPUT_COLUMNS].copy()
@@ -525,6 +596,19 @@ def build_training_dataframe(cfg: dict[str, Any]) -> pd.DataFrame:
     logger.info("Columns: %s", len(final_df.columns))
 
     return final_df
+
+
+def build_historical_features(config: dict[str, Any] | None = None) -> pd.DataFrame:
+    """
+    Backward-compatible helper used by training_pipeline.py fallbacks.
+    Builds historical training features locally without uploading to Hopsworks.
+    """
+    cfg = load_config()
+    if config:
+        cfg.update(config)
+
+    validate_config(cfg, upload=False)
+    return build_training_dataframe(cfg)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -559,6 +643,24 @@ def prepare_for_hopsworks(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["ingestion_timestamp"] = pd.to_datetime(df["ingestion_timestamp"], errors="coerce")
+
+    # Strict dtypes help avoid Hopsworks schema mismatch errors.
+    integer_columns = ["hour", "day_of_week", "is_weekend"]
+    float_columns = [
+        col for col in RAW_FEATURE_COLUMNS
+        + DERIVED_DIAGNOSTIC_COLUMNS
+        + BASE_MODEL_FEATURE_COLUMNS
+        + ["hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos", TARGET_COLUMN]
+        if col in df.columns
+    ]
+
+    for col in float_columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+
+    for col in integer_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype("int64")
+
     return df.dropna(subset=["timestamp", "ingestion_timestamp"])
 
 
@@ -569,8 +671,8 @@ def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
         name=cfg["feature_group_name"],
         version=cfg["feature_group_version"],
         description=(
-            "Historical training feature group for AQI model. Includes raw Open-Meteo "
-            "air-quality/weather features, 12 derived model features, and Open-Meteo us_aqi target."
+            "Historical training feature group for 19-feature AQI model. Includes raw Open-Meteo "
+            "air-quality/weather features, 12 derived model features, 7 time features, and us_aqi target."
         ),
         primary_key=["city", "timestamp"],
         event_time="timestamp",
@@ -581,8 +683,9 @@ def write_to_hopsworks(df: pd.DataFrame, cfg: dict[str, Any]) -> None:
 
     logger.info("Rows to insert: %s", len(df_to_insert))
     logger.info("Columns to insert: %s", len(df_to_insert.columns))
+    logger.info("Insert dataframe dtypes:\n%s", df_to_insert.dtypes)
 
-    # wait_for_job=False avoids local connection drops during materialization wait.
+    # wait_for_job=False avoids local/GitHub Actions connection drops during materialization wait.
     fg.insert(df_to_insert, write_options={"wait_for_job": False})
 
     logger.info("Training features submitted to Hopsworks successfully.")

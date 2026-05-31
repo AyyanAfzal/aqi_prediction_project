@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
 from html import escape
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import hopsworks
-import joblib
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -25,21 +21,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-
-DEFAULT_FEATURE_COLUMNS = [
-    "pm25_24h",
-    "pm10_24h",
-    "o3_8h_ppb",
-    "co_8h_ppm",
-    "no2_1h_ppb",
-    "temperature_2m",
-    "relative_humidity_2m",
-    "precipitation",
-    "windspeed_10m",
-    "surface_pressure",
-    "shortwave_radiation",
-    "et0_fao_evapotranspiration",
-]
 
 POLLUTANT_COLUMNS = [
     ("PM2.5", "pm25_24h", "µg/m³", "Fine particles"),
@@ -508,296 +489,83 @@ def get_pollutant_level(column: str, value: float | int | None) -> str:
     return "Unknown"
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = (
-        df.columns.astype(str)
-        .str.strip()
-        .str.lower()
-        .str.replace(" ", "_", regex=False)
-        .str.replace("-", "_", regex=False)
-    )
-    return df
-
-
-def parse_datetime_column(series: pd.Series, timezone_name: str) -> pd.Series:
-    parsed = pd.to_datetime(series, errors="coerce")
-
-    try:
-        if parsed.dt.tz is not None:
-            return parsed.dt.tz_convert(timezone_name).dt.tz_localize(None)
-        return parsed
-    except Exception:
-        return (
-            pd.to_datetime(series.astype(str), errors="coerce", utc=True)
-            .dt.tz_convert(timezone_name)
-            .dt.tz_localize(None)
-        )
-
-
-def find_file(root: Path, preferred_names: list[str], fallback_patterns: list[str]) -> Path:
-    for name in preferred_names:
-        matches = list(root.rglob(name))
-        if matches:
-            return matches[0]
-
-    for pattern in fallback_patterns:
-        matches = list(root.rglob(pattern))
-        if matches:
-            return matches[0]
-
-    raise FileNotFoundError(f"Could not find model file inside downloaded folder: {root}")
-
-
-def find_optional_file(root: Path, filename: str) -> Path | None:
-    matches = list(root.rglob(filename))
-    return matches[0] if matches else None
-
-
-@st.cache_resource(show_spinner=False)
-def connect_to_hopsworks(host: str, project_name: str, api_key: str):
-    return hopsworks.login(
-        host=host,
-        project=project_name,
-        api_key_value=api_key,
-    )
-
-
-def get_latest_model_metadata(mr, model_name: str, model_version: str | None):
-    if model_version not in [None, "", "None", "none"]:
-        return mr.get_model(model_name, version=int(model_version))
-
-    try:
-        return mr.get_model(model_name)
-    except Exception:
-        models = mr.get_models(model_name)
-        if not models:
-            raise ValueError(f"No model versions found for {model_name}")
-
-        return sorted(
-            models,
-            key=lambda model_obj: int(getattr(model_obj, "version", 0)),
-            reverse=True,
-        )[0]
-
-
-@st.cache_resource(show_spinner=False)
-def load_model_from_registry(_project, model_name: str, model_version: str | None):
-    mr = _project.get_model_registry()
-    model_meta = get_latest_model_metadata(mr, model_name, model_version)
-
-    model_dir = Path(model_meta.download())
-
-    model_path = find_file(
-        root=model_dir,
-        preferred_names=["model.pkl", "model.joblib", "best_model.pkl"],
-        fallback_patterns=["*.pkl", "*.joblib"],
-    )
-
-    loaded = joblib.load(model_path)
-
-    if isinstance(loaded, dict) and "model" in loaded:
-        model = loaded["model"]
-        feature_columns = loaded.get("feature_columns", DEFAULT_FEATURE_COLUMNS)
-        best_model_name = loaded.get("best_model_name", "Best AQI Model")
-    else:
-        model = loaded
-        feature_columns = getattr(model, "feature_names_in_", DEFAULT_FEATURE_COLUMNS)
-        best_model_name = "Best AQI Model"
-
-    feature_json_path = find_optional_file(model_dir, "feature_columns.json")
-    if feature_json_path is not None:
-        with open(feature_json_path, "r", encoding="utf-8") as file:
-            feature_json = json.load(file)
-
-        if isinstance(feature_json, list):
-            feature_columns = feature_json
-        elif isinstance(feature_json, dict):
-            feature_columns = feature_json.get("feature_columns", feature_columns)
-
-    metadata = {}
-
-    for metadata_filename in ["model_metadata.json", "metadata.json", "metrics.json"]:
-        metadata_path = find_optional_file(model_dir, metadata_filename)
-        if metadata_path is not None:
-            with open(metadata_path, "r", encoding="utf-8") as file:
-                loaded_metadata = json.load(file)
-            if isinstance(loaded_metadata, dict):
-                metadata.update(loaded_metadata)
-
-    best_model_name = metadata.get("best_model_name", metadata.get("model_name", best_model_name))
-    feature_columns = [str(col).strip().lower() for col in list(feature_columns)]
-
-    return {
-        "model": model,
-        "feature_columns": feature_columns,
-        "metadata": metadata,
-        "model_version": getattr(model_meta, "version", None),
-        "best_model_name": best_model_name,
-        "model_path": str(model_path),
-    }
-
-
 @st.cache_data(ttl=900, show_spinner=False)
-def load_forecast_features_from_hopsworks(_project, fg_name: str, fg_version: int) -> pd.DataFrame:
-    fs = _project.get_feature_store()
-    fg = fs.get_feature_group(name=fg_name, version=fg_version)
+def fetch_predictions(api_url: str, hours: int) -> dict:
+    api_url = api_url.rstrip("/")
+    endpoint = f"{api_url}/predictions"
 
-    try:
-        df = fg.read(dataframe_type="pandas", read_options={"use_hive": True})
-    except Exception:
-        try:
-            df = fg.read(dataframe_type="pandas")
-        except Exception:
-            df = fg.read()
-
-    if df.empty:
-        raise ValueError("Forecast Feature Group is empty.")
-
-    return df
-
-
-def prepare_prediction_dataframe(
-    raw_df: pd.DataFrame,
-    feature_columns: list[str],
-    prediction_hours: int,
-    timezone_name: str,
-) -> pd.DataFrame:
-    df = normalize_columns(raw_df)
-
-    if "timestamp" not in df.columns:
-        raise ValueError("Forecast Feature Group must contain a timestamp column.")
-
-    df["timestamp"] = parse_datetime_column(df["timestamp"], timezone_name)
-    df = df.dropna(subset=["timestamp"]).copy()
-
-    for col in ["forecast_run_timestamp", "ingestion_timestamp"]:
-        if col in df.columns:
-            df[col] = parse_datetime_column(df[col], timezone_name)
-
-    run_col = None
-    if "forecast_run_timestamp" in df.columns:
-        run_col = "forecast_run_timestamp"
-    elif "ingestion_timestamp" in df.columns:
-        run_col = "ingestion_timestamp"
-
-    if run_col is not None and df[run_col].notna().any():
-        latest_run = df[run_col].max()
-        df = df[df[run_col] == latest_run].copy()
-
-    if "is_future" in df.columns:
-        df["is_future"] = pd.to_numeric(df["is_future"], errors="coerce").fillna(0).astype(int)
-        future_df = df[df["is_future"] == 1].copy()
-    else:
-        now_local = pd.Timestamp.now(tz=ZoneInfo(timezone_name)).tz_localize(None).floor("h")
-        future_df = df[df["timestamp"] > now_local].copy()
-
-    if future_df.empty:
-        raise ValueError(
-            "No future forecast rows found. Run the hourly feature pipeline first, then refresh this app."
-        )
-
-    subset_cols = ["timestamp"]
-    if "city" in future_df.columns:
-        subset_cols = ["city", "timestamp"]
-
-    sort_cols = ["timestamp"]
-    if run_col is not None:
-        sort_cols = [run_col, "timestamp"]
-
-    future_df = (
-        future_df.sort_values(sort_cols)
-        .drop_duplicates(subset=subset_cols, keep="last")
-        .sort_values("timestamp")
-        .head(prediction_hours)
-        .reset_index(drop=True)
+    response = requests.get(
+        endpoint,
+        params={"hours": hours},
+        timeout=120,
     )
 
-    missing_features = [col for col in feature_columns if col not in future_df.columns]
-    if missing_features:
-        raise ValueError("Forecast Feature Group is missing model features: " + ", ".join(missing_features))
+    response.raise_for_status()
+    payload = response.json()
 
-    for col in feature_columns:
-        future_df[col] = pd.to_numeric(future_df[col], errors="coerce")
-        median_value = future_df[col].median()
+    if payload.get("status") != "success":
+        raise ValueError(f"API returned unsuccessful status: {payload}")
 
-        if pd.isna(median_value):
-            median_value = 0.0
-
-        future_df[col] = future_df[col].fillna(median_value)
-
-    return future_df
+    return payload
 
 
-def predict_aqi(forecast_df: pd.DataFrame, model, feature_columns: list[str]) -> pd.DataFrame:
-    df = forecast_df.copy()
+def payload_to_dataframes(payload: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    hourly_df = pd.DataFrame(payload.get("hourly", []))
+    daily_df = pd.DataFrame(payload.get("daily", []))
+    pollutant_df = pd.DataFrame(payload.get("pollutants", []))
 
-    predictions = model.predict(df[feature_columns])
-    predictions = np.clip(predictions, 0, 500)
+    if hourly_df.empty:
+        raise ValueError("API returned no hourly prediction rows.")
 
-    df["predicted_aqi"] = predictions
-    df["predicted_aqi"] = df["predicted_aqi"].round(1)
-    df["aqi_category"] = df["predicted_aqi"].apply(get_aqi_category)
-    df["aqi_color"] = df["aqi_category"].map(AQI_COLORS).fillna(AQI_COLORS["Unknown"])
+    if "timestamp" in hourly_df.columns:
+        hourly_df["timestamp"] = pd.to_datetime(hourly_df["timestamp"], errors="coerce")
 
-    return df
+    for col in ["start_time", "end_time"]:
+        if col in daily_df.columns:
+            daily_df[col] = pd.to_datetime(daily_df[col], errors="coerce")
 
-
-def make_three_day_summary(hourly_df: pd.DataFrame) -> pd.DataFrame:
-    df = hourly_df.copy().sort_values("timestamp").reset_index(drop=True)
-    df["forecast_day"] = (np.arange(len(df)) // 24) + 1
-
-    agg_dict = {
-        "predicted_aqi": "mean",
-        "timestamp": ["min", "max"],
-    }
-
-    if "openmeteo_us_aqi_reference" in df.columns:
-        df["openmeteo_us_aqi_reference"] = pd.to_numeric(df["openmeteo_us_aqi_reference"], errors="coerce")
-        agg_dict["openmeteo_us_aqi_reference"] = "mean"
-
-    for _, col, _, _ in POLLUTANT_COLUMNS:
-        if col in df.columns:
-            agg_dict[col] = "mean"
-
-    summary = df.groupby("forecast_day").agg(agg_dict).head(3)
-
-    summary.columns = [
-        "_".join(col).strip("_") if isinstance(col, tuple) else col
-        for col in summary.columns
+    numeric_cols = [
+        "predicted_aqi",
+        "openmeteo_us_aqi_reference",
+        "pm25_24h",
+        "pm10_24h",
+        "o3_8h_ppb",
+        "co_8h_ppm",
+        "no2_1h_ppb",
+        "temperature_2m",
+        "relative_humidity_2m",
+        "precipitation",
+        "windspeed_10m",
+        "surface_pressure",
     ]
 
-    summary = summary.reset_index()
+    for col in numeric_cols:
+        if col in hourly_df.columns:
+            hourly_df[col] = pd.to_numeric(hourly_df[col], errors="coerce")
 
-    summary = summary.rename(
-        columns={
-            "predicted_aqi_mean": "predicted_aqi",
-            "timestamp_min": "start_time",
-            "timestamp_max": "end_time",
-            "openmeteo_us_aqi_reference_mean": "openmeteo_us_aqi_reference",
-            "pm25_24h_mean": "pm25_24h",
-            "pm10_24h_mean": "pm10_24h",
-            "o3_8h_ppb_mean": "o3_8h_ppb",
-            "co_8h_ppm_mean": "co_8h_ppm",
-            "no2_1h_ppb_mean": "no2_1h_ppb",
-        }
-    )
+        if col in daily_df.columns:
+            daily_df[col] = pd.to_numeric(daily_df[col], errors="coerce")
 
-    summary["predicted_aqi"] = summary["predicted_aqi"].round(1)
-    summary["aqi_category"] = summary["predicted_aqi"].apply(get_aqi_category)
+    if "value" in pollutant_df.columns:
+        pollutant_df["value"] = pd.to_numeric(pollutant_df["value"], errors="coerce")
 
-    return summary
+    return hourly_df, daily_df, pollutant_df
 
 
-def render_hero(city_name: str, country_name: str, hourly_predictions: pd.DataFrame) -> None:
-    current_aqi = float(hourly_predictions.iloc[0]["predicted_aqi"])
-    avg_aqi = float(hourly_predictions["predicted_aqi"].mean())
-    max_aqi = float(hourly_predictions["predicted_aqi"].max())
+def render_hero(
+    city_name: str,
+    country_name: str,
+    hourly_predictions: pd.DataFrame,
+    summary: dict,
+) -> None:
+    current_aqi = float(summary.get("current_aqi", hourly_predictions.iloc[0]["predicted_aqi"]))
+    avg_aqi = float(summary.get("average_aqi_72h", hourly_predictions["predicted_aqi"].mean()))
+    max_aqi = float(summary.get("peak_aqi_72h", hourly_predictions["predicted_aqi"].max()))
 
-    category = get_aqi_category(current_aqi)
+    category = str(summary.get("current_category", get_aqi_category(current_aqi)))
     color = AQI_COLORS.get(category, AQI_COLORS["Unknown"])
     text_color = AQI_TEXT_COLORS.get(category, "#0f172a")
-    advice = get_aqi_advice(category)
+    advice = str(summary.get("current_advice", get_aqi_advice(category)))
 
     start_time = hourly_predictions["timestamp"].min().strftime("%d %b, %I:%M %p")
     end_time = hourly_predictions["timestamp"].max().strftime("%d %b, %I:%M %p")
@@ -843,8 +611,8 @@ def render_day_card(day_label: str, start_time, end_time, aqi: float, category: 
     text_color = AQI_TEXT_COLORS.get(category, "#0f172a")
     advice = get_aqi_advice(category)
 
-    start_label = start_time.strftime("%d %b, %I:%M %p")
-    end_label = end_time.strftime("%d %b, %I:%M %p")
+    start_label = pd.to_datetime(start_time).strftime("%d %b, %I:%M %p")
+    end_label = pd.to_datetime(end_time).strftime("%d %b, %I:%M %p")
 
     render_html(
         [
@@ -861,8 +629,17 @@ def render_day_card(day_label: str, start_time, end_time, aqi: float, category: 
     )
 
 
-def render_pollutant_card(name: str, col: str, unit: str, desc: str, value: float) -> None:
-    level = get_pollutant_level(col, value)
+def render_pollutant_card(
+    name: str,
+    col: str,
+    unit: str,
+    desc: str,
+    value: float,
+    level: str | None = None,
+) -> None:
+    if level is None:
+        level = get_pollutant_level(col, value)
+
     color = AQI_COLORS.get(level, AQI_COLORS["Unknown"])
     text_color = AQI_TEXT_COLORS.get(level, "#0f172a")
 
@@ -969,31 +746,22 @@ def render_hourly_chart(hourly_df: pd.DataFrame) -> None:
     )
 
 
-def render_pollutant_bar_chart(hourly_df: pd.DataFrame) -> None:
-    rows = []
-
-    for name, col, unit, _ in POLLUTANT_COLUMNS:
-        if col in hourly_df.columns:
-            rows.append(
-                {
-                    "Pollutant": name,
-                    "Value": float(pd.to_numeric(hourly_df[col], errors="coerce").mean()),
-                    "Unit": unit,
-                }
-            )
-
-    if not rows:
+def render_pollutant_bar_chart(pollutant_df: pd.DataFrame) -> None:
+    if pollutant_df.empty:
         return
 
-    chart_df = pd.DataFrame(rows)
+    chart_df = pollutant_df.copy()
+
+    if not {"name", "value", "unit"}.issubset(chart_df.columns):
+        return
 
     fig = go.Figure()
 
     fig.add_trace(
         go.Bar(
-            x=chart_df["Pollutant"],
-            y=chart_df["Value"],
-            text=[f"{value:.2f} {unit}" for value, unit in zip(chart_df["Value"], chart_df["Unit"])],
+            x=chart_df["name"],
+            y=chart_df["value"],
+            text=[f"{value:.2f} {unit}" for value, unit in zip(chart_df["value"], chart_df["unit"])],
             textposition="outside",
             marker_color="#2563eb",
             name="72h Average",
@@ -1025,44 +793,19 @@ def render_sidebar() -> dict:
     with st.sidebar:
         st.header("⚙️ Dashboard Settings")
 
-        city_name = get_setting("CITY_NAME", "Hyderabad")
-        country_name = get_setting("COUNTRY_NAME", "Pakistan")
-        timezone_name = get_setting("TIMEZONE", "Asia/Karachi")
-
-        hopsworks_host = get_setting("HOPSWORKS_HOST", "eu-west.cloud.hopsworks.ai")
-        hopsworks_project = get_setting("HOPSWORKS_PROJECT")
-        hopsworks_api_key = get_setting("HOPSWORKS_API_KEY")
-
-        forecast_fg_name = get_setting("FORECAST_FEATURE_GROUP_NAME", "aqi_openmeteo_12f_forecast_fg")
-        forecast_fg_version = int(get_setting("FORECAST_FEATURE_GROUP_VERSION", "1"))
-
-        model_name = get_setting("MODEL_NAME", "aqi_openmeteo_12f_best_model")
-        model_version = get_setting("MODEL_VERSION", None)
-
+        api_url = get_setting("FASTAPI_URL", "http://127.0.0.1:8000")
         prediction_hours = int(get_setting("PREDICTION_HOURS", "72"))
 
-        st.caption("Connected project")
-        st.write(f"**City:** {city_name}")
-        st.write(f"**Timezone:** {timezone_name}")
-        st.write(f"**Forecast FG:** `{forecast_fg_name}` v{forecast_fg_version}")
-        st.write(f"**Model:** `{model_name}`")
+        st.caption("Backend API")
+        st.write(f"**FastAPI URL:** `{api_url}`")
+        st.write(f"**Forecast window:** `{prediction_hours}` hours")
 
-        if st.button("🔄 Refresh from Hopsworks", use_container_width=True):
+        if st.button("🔄 Refresh from FastAPI", use_container_width=True):
             st.cache_data.clear()
-            st.cache_resource.clear()
             st.rerun()
 
     return {
-        "city_name": city_name,
-        "country_name": country_name,
-        "timezone_name": timezone_name,
-        "hopsworks_host": hopsworks_host,
-        "hopsworks_project": hopsworks_project,
-        "hopsworks_api_key": hopsworks_api_key,
-        "forecast_fg_name": forecast_fg_name,
-        "forecast_fg_version": forecast_fg_version,
-        "model_name": model_name,
-        "model_version": model_version,
+        "api_url": api_url,
         "prediction_hours": prediction_hours,
     }
 
@@ -1072,69 +815,48 @@ def main() -> None:
 
     settings = render_sidebar()
 
-    missing = []
-    if not settings["hopsworks_project"]:
-        missing.append("HOPSWORKS_PROJECT")
-    if not settings["hopsworks_api_key"]:
-        missing.append("HOPSWORKS_API_KEY")
-    if not settings["hopsworks_host"]:
-        missing.append("HOPSWORKS_HOST")
+    try:
+        with st.spinner("Loading AQI predictions from FastAPI..."):
+            payload = fetch_predictions(
+                api_url=settings["api_url"],
+                hours=settings["prediction_hours"],
+            )
 
-    if missing:
-        st.error(f"Missing required secrets/env values: {', '.join(missing)}")
+        hourly_predictions, three_day_summary, pollutant_df = payload_to_dataframes(payload)
+
+        location = payload.get("location", {})
+        summary = payload.get("summary", {})
+        model_info = payload.get("model", {})
+
+        city_name = location.get("city", "Hyderabad")
+        country_name = location.get("country", "Pakistan")
+
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "FastAPI backend is not running. Start it first with:\n\n"
+            "`uvicorn api.main:app --reload --port 8000`"
+        )
         st.stop()
 
-    try:
-        with st.spinner("Connecting to Hopsworks..."):
-            project = connect_to_hopsworks(
-                host=settings["hopsworks_host"],
-                project_name=settings["hopsworks_project"],
-                api_key=settings["hopsworks_api_key"],
-            )
-
-        with st.spinner("Loading latest model from Hopsworks Model Registry..."):
-            model_bundle = load_model_from_registry(
-                project,
-                model_name=settings["model_name"],
-                model_version=settings["model_version"],
-            )
-
-        with st.spinner("Loading latest forecast features from Hopsworks..."):
-            raw_forecast_df = load_forecast_features_from_hopsworks(
-                project,
-                fg_name=settings["forecast_fg_name"],
-                fg_version=settings["forecast_fg_version"],
-            )
-
-        forecast_df = prepare_prediction_dataframe(
-            raw_df=raw_forecast_df,
-            feature_columns=model_bundle["feature_columns"],
-            prediction_hours=settings["prediction_hours"],
-            timezone_name=settings["timezone_name"],
-        )
-
-        hourly_predictions = predict_aqi(
-            forecast_df=forecast_df,
-            model=model_bundle["model"],
-            feature_columns=model_bundle["feature_columns"],
-        )
-
-        three_day_summary = make_three_day_summary(hourly_predictions)
-
-    except Exception as error:
-        st.error("App failed while loading data/model or generating predictions.")
+    except requests.exceptions.HTTPError as error:
+        st.error("FastAPI returned an error.")
         st.exception(error)
         st.stop()
 
-    render_hero(settings["city_name"], settings["country_name"], hourly_predictions)
+    except Exception as error:
+        st.error("App failed while loading predictions from FastAPI.")
+        st.exception(error)
+        st.stop()
 
-    first_aqi = float(hourly_predictions.iloc[0]["predicted_aqi"])
-    max_aqi = float(hourly_predictions["predicted_aqi"].max())
-    avg_aqi = float(hourly_predictions["predicted_aqi"].mean())
+    render_hero(city_name, country_name, hourly_predictions, summary)
 
-    first_category = get_aqi_category(first_aqi)
-    max_category = get_aqi_category(max_aqi)
-    avg_category = get_aqi_category(avg_aqi)
+    first_aqi = float(summary.get("current_aqi", hourly_predictions.iloc[0]["predicted_aqi"]))
+    max_aqi = float(summary.get("peak_aqi_72h", hourly_predictions["predicted_aqi"].max()))
+    avg_aqi = float(summary.get("average_aqi_72h", hourly_predictions["predicted_aqi"].mean()))
+
+    first_category = str(summary.get("current_category", get_aqi_category(first_aqi)))
+    max_category = str(summary.get("peak_category", get_aqi_category(max_aqi)))
+    avg_category = str(summary.get("average_category", get_aqi_category(avg_aqi)))
 
     metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
     metric_col1.metric("Current AQI", f"{first_aqi:.0f}", first_category)
@@ -1164,37 +886,29 @@ def main() -> None:
 
     render_section(
         "📈 Hourly AQI Trend",
-        "The chart is zoomed around your actual predicted AQI range, so small changes are visible.",
+        "Predictions are served by FastAPI and displayed in the Streamlit dashboard.",
     )
     render_hourly_chart(hourly_predictions)
 
     render_section("🧪 Pollutant Levels", "72-hour average pollutant values with AQI-style level badges.")
 
-    pollutant_values = {}
-    for name, col, unit, desc in POLLUTANT_COLUMNS:
-        if col in hourly_predictions.columns:
-            pollutant_values[col] = {
-                "name": name,
-                "unit": unit,
-                "desc": desc,
-                "value": float(pd.to_numeric(hourly_predictions[col], errors="coerce").mean()),
-            }
-
-    if not pollutant_values:
-        st.info("No pollutant columns were found in the forecast Feature Group.")
+    if pollutant_df.empty:
+        st.info("No pollutant values were returned by the FastAPI backend.")
     else:
-        pollutant_cols = st.columns(len(pollutant_values))
-        for i, (col, item) in enumerate(pollutant_values.items()):
+        pollutant_cols = st.columns(len(pollutant_df))
+
+        for i, (_, row) in enumerate(pollutant_df.iterrows()):
             with pollutant_cols[i]:
                 render_pollutant_card(
-                    name=item["name"],
-                    col=col,
-                    unit=item["unit"],
-                    desc=item["desc"],
-                    value=item["value"],
+                    name=str(row.get("name", "Pollutant")),
+                    col=str(row.get("column", "")),
+                    unit=str(row.get("unit", "")),
+                    desc=str(row.get("description", "")),
+                    value=float(row.get("value", 0.0)),
+                    level=str(row.get("level", "Unknown")),
                 )
 
-        render_pollutant_bar_chart(hourly_predictions)
+        render_pollutant_bar_chart(pollutant_df)
 
     render_section("📋 3-Day Forecast Table")
 
@@ -1261,17 +975,21 @@ def main() -> None:
 
         st.dataframe(hourly_display, use_container_width=True, hide_index=True)
 
-    with st.expander("Model and data source info"):
-        st.write("**Best model:**", model_bundle.get("best_model_name"))
-        st.write("**Model registry name:**", settings["model_name"])
-        st.write("**Model version:**", model_bundle.get("model_version"))
-        st.write("**Model path:**", model_bundle.get("model_path"))
-        st.write("**Feature Group:**", f"{settings['forecast_fg_name']} v{settings['forecast_fg_version']}")
-        st.write("**Feature count:**", len(model_bundle["feature_columns"]))
-        st.write("**Feature columns:**", model_bundle["feature_columns"])
+    with st.expander("FastAPI model and data source info"):
+        st.write("**Backend API:**", settings["api_url"])
+        st.write("**Model registry name:**", model_info.get("model_name"))
+        st.write("**Model version:**", model_info.get("model_version"))
+        st.write("**Best model:**", model_info.get("best_model_name"))
+        st.write("**Feature count:**", model_info.get("feature_count"))
+        st.write("**Feature columns:**", model_info.get("feature_columns"))
 
-        if model_bundle["metadata"]:
-            st.json(model_bundle["metadata"])
+        st.json(
+            {
+                "location": location,
+                "summary": summary,
+                "model": model_info,
+            }
+        )
 
 
 if __name__ == "__main__":

@@ -13,3 +13,8 @@ matplotlib
 streamlit
 plotly
 shap
+fastapi
+uvicorn
+fastapi
+uvicorn
+requests

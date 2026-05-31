@@ -2,8 +2,8 @@ name: Hourly Feature Pipeline
 
 on:
   schedule:
-    # Runs every hour at minute 0 (UTC)
-    - cron: "0 * * * *"
+    # Runs every hour at minute 10 (UTC)
+    - cron: "10 * * * *"
   workflow_dispatch:
 
 permissions:

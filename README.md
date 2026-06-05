@@ -1,176 +1,372 @@
-# Serverless AQI Predictor 🌫️
+# Serverless AQI Predictor
 
-A production-style AQI forecasting project for **Hyderabad, Pakistan** using **Open-Meteo**, **Hopsworks Feature Store**, **GitHub Actions**, and **Streamlit**.
+## Hyderabad AQI Forecasting System
 
-The system collects historical and forecast air-quality/weather data, engineers features, trains machine learning models, stores the best model in Hopsworks Model Registry, and serves a clean Streamlit dashboard that predicts AQI for the next 3 days.
+A complete end-to-end air quality forecasting system that predicts the **Air Quality Index (AQI) for Hyderabad, Pakistan for the next 72 hours** using Open-Meteo data, Hopsworks Feature Store, GitHub Actions automation, FastAPI backend, and a Streamlit dashboard.
 
 ---
 
 ## Project Overview
 
-This project predicts the next **72 hours / 3 days AQI** using forecast features from Open-Meteo and a trained machine learning model stored in Hopsworks.
+This project forecasts AQI for the next 3 days by combining future weather forecasts, pollutant forecasts, engineered time-based features, and a trained machine learning model.
 
-The current model setup uses **19 features**:
+The system is designed as a serverless-style ML pipeline:
 
-- 12 air-quality/weather features
-- 7 time-based features
+* Open-Meteo provides weather and air-quality data.
+* Feature pipelines generate training and forecast features.
+* Hopsworks stores features and the trained model.
+* GitHub Actions automates hourly and daily workflows.
+* FastAPI serves predictions through an API.
+* Streamlit displays the AQI dashboard.
 
-No month-based features are used because the project is not yet trained on full yearly/seasonal data.
+The main goal is not just to train a model, but to build a working production-style AQI forecasting pipeline.
+
+---
+
+## Live Demo
+
+### Streamlit Dashboard
+
+```text
+https://hyderabadaqi046.streamlit.app/
+```
+
+### FastAPI Backend
+
+```text
+https://ayyan22bscs046-hyderabad-aqi-api.hf.space
+```
+
+### API Health Check
+
+```text
+https://ayyan22bscs046-hyderabad-aqi-api.hf.space/health
+```
+
+### Prediction Endpoint
+
+```text
+https://ayyan22bscs046-hyderabad-aqi-api.hf.space/predictions?hours=72
+```
 
 ---
 
 ## Tech Stack
 
-- Python
-- Pandas
-- NumPy
-- Requests
-- Scikit-learn
-- XGBoost
-- Hopsworks Feature Store
-- Hopsworks Model Registry
-- GitHub Actions
-- Streamlit
-- Plotly
-- Open-Meteo APIs
+| Component            | Technology                                 |
+| -------------------- | ------------------------------------------ |
+| Data Source          | Open-Meteo Weather API and Air Quality API |
+| Programming Language | Python                                     |
+| Data Processing      | Pandas, NumPy                              |
+| Machine Learning     | Scikit-learn, XGBoost                      |
+| Feature Store        | Hopsworks Feature Store                    |
+| Model Registry       | Hopsworks Model Registry                   |
+| Automation           | GitHub Actions                             |
+| Backend API          | FastAPI                                    |
+| Frontend Dashboard   | Streamlit                                  |
+| Backend Deployment   | Hugging Face Docker Space                  |
+| Frontend Deployment  | Streamlit Cloud                            |
 
 ---
 
-## Project Architecture
+## System Architecture
 
 ```text
 Open-Meteo APIs
-     |
-     |-- Historical AQI + Weather Data
-     |       |
-     |       v
-     |   Backfill Pipeline
-     |       |
-     |       v
-     |   Hopsworks Training Feature Group
-     |       |
-     |       v
-     |   Training Pipeline
-     |       |
-     |       v
-     |   Hopsworks Model Registry
-     |
-     |-- Future Forecast AQI + Weather Data
-             |
-             v
-       Feature Pipeline
-             |
-             v
-       Hopsworks Forecast Feature Group
-             |
-             v
-       Streamlit AQI Dashboard
+    |
+    |-- Weather Forecast Data
+    |-- Air Quality Forecast Data
+    |
+Feature Engineering Pipelines
+    |
+    |-- Historical Training Features
+    |-- Future Forecast Features
+    |
+Hopsworks Feature Store
+    |
+    |-- Training Feature Group
+    |-- Forecast Feature Group
+    |
+Training Pipeline
+    |
+    |-- Trains ML Models
+    |-- Evaluates Metrics
+    |-- Registers Best Model
+    |
+Hopsworks Model Registry
+    |
+FastAPI Backend
+    |
+    |-- Loads Latest Model
+    |-- Reads Latest Forecast Features
+    |-- Generates 72-hour AQI Predictions
+    |
+Streamlit Dashboard
+    |
+    |-- Current AQI
+    |-- 3-Day Forecast
+    |-- Hourly Trend
+    |-- Pollutant Breakdown
+    |-- AQI Alerts
 ```
 
 ---
 
-## Current Hopsworks Resources
-
-### Training Feature Group
-
-```text
-aqi_openmeteo_19f_training_fg
-```
-
-Used by the training pipeline.
-
-### Forecast Feature Group
-
-```text
-aqi_openmeteo_19f_forecast_fg
-```
-
-Used by the hourly feature pipeline and Streamlit dashboard.
-
-### Model Registry Name
-
-```text
-aqi_openmeteo_19f_best_model
-```
-
-Used by the Streamlit dashboard to load the latest registered model.
-
----
-
-## Feature Set
-
-### Base AQI/Weather Features
-
-```text
-pm25_24h
-pm10_24h
-o3_8h_ppb
-co_8h_ppm
-no2_1h_ppb
-temperature_2m
-relative_humidity_2m
-precipitation
-windspeed_10m
-surface_pressure
-shortwave_radiation
-et0_fao_evapotranspiration
-```
-
-### Time-Based Features
-
-```text
-hour
-day_of_week
-is_weekend
-hour_sin
-hour_cos
-day_of_week_sin
-day_of_week_cos
-```
-
-### Not Used
-
-```text
-month
-month_sin
-month_cos
-```
-
-These are intentionally not included because the project is currently trained on limited historical data, not a full yearly dataset.
-
----
-
-## Repository Structure
+## Project Structure
 
 ```text
 aqi-predictor/
-│
-├── app/
-│   └── app.py
-│
-├── pipelines/
-│   ├── backfill_pipeline.py
-│   ├── feature_pipeline.py
-│   ├── training_pipeline.py
-│   ├── test_future_aqi_predictions.py
-│   └── experiments.py
-│
-├── reports/
-│   └── generated reports and CSV outputs
-│
-├── models/
-│   └── local model artifacts
-│
-├── data/
-│   └── local cache and training CSV files
 │
 ├── .github/
 │   └── workflows/
 │       ├── feature_pipeline.yml
 │       └── training_pipeline.yml
 │
+├── api/
+│   ├── __init__.py
+│   └── main.py
+│
+├── app/
+│   └── app.py
+│
+├── data/
+│   └── openmeteo_19f_training_features.csv
+│
+├── models/
+│   └── best_model.pkl
+│
+├── notebooks/
+│   └── eda.ipynb
+│
+├── pipelines/
+│   ├── feature_pipeline.py
+│   ├── backfill_pipeline.py
+│   ├── training_pipeline.py
+│   └── test_future_aqi_predictions.py
+│
+├── reports/
+│   ├── model_metrics.csv
+│   ├── selected_features.csv
+│   ├── feature_importance.csv
+│   └── figures/
+│
+├── Dockerfile
 ├── requirements.txt
-└── README.md
+├── requirements-dev.txt
+├── README.md
+└── .gitignore
+```
+
+---
+
+## Dataset Details
+
+| Item                 | Details                                    |
+| -------------------- | ------------------------------------------ |
+| City                 | Hyderabad, Pakistan                        |
+| Data Source          | Open-Meteo Weather API and Air Quality API |
+| Data Type            | Hourly weather, pollutant, and AQI data    |
+| Historical Period    | Last 180 days                              |
+| Approximate Duration | Around 6 months                            |
+| Time Granularity     | Hourly                                     |
+| Approximate Rows     | Around 4,320 hourly records                |
+| Target Variable      | `us_aqi`                                   |
+| Forecast Horizon     | Next 72 hours / 3 days                     |
+| Final Feature Count  | 19 features                                |
+
+---
+
+## Final Feature Set
+
+The final production model uses 19 forecast-compatible features.
+
+### Pollutant Features
+
+| Feature      | Description                                                |
+| ------------ | ---------------------------------------------------------- |
+| `pm25_24h`   | PM2.5 24-hour rolling average                              |
+| `pm10_24h`   | PM10 24-hour rolling average                               |
+| `o3_8h_ppb`  | Ozone converted to ppb and averaged over 8 hours           |
+| `co_8h_ppm`  | Carbon monoxide converted to ppm and averaged over 8 hours |
+| `no2_1h_ppb` | Nitrogen dioxide converted to ppb                          |
+
+### Weather Features
+
+| Feature                      | Description                 |
+| ---------------------------- | --------------------------- |
+| `temperature_2m`             | Temperature forecast        |
+| `relative_humidity_2m`       | Relative humidity forecast  |
+| `precipitation`              | Precipitation forecast      |
+| `windspeed_10m`              | Wind speed forecast         |
+| `surface_pressure`           | Surface pressure forecast   |
+| `shortwave_radiation`        | Solar radiation forecast    |
+| `et0_fao_evapotranspiration` | Evapotranspiration forecast |
+
+### Time-Based Features
+
+| Feature           | Description                        |
+| ----------------- | ---------------------------------- |
+| `hour`            | Hour of the day                    |
+| `day_of_week`     | Day of week                        |
+| `is_weekend`      | Weekend indicator                  |
+| `hour_sin`        | Cyclic hour sine encoding          |
+| `hour_cos`        | Cyclic hour cosine encoding        |
+| `day_of_week_sin` | Cyclic day-of-week sine encoding   |
+| `day_of_week_cos` | Cyclic day-of-week cosine encoding |
+
+---
+
+## Why AQI Features Were Not Used as Inputs
+
+Open-Meteo also provides future AQI forecasts. However, future AQI values were not used as model input features.
+
+Using AQI as an input while predicting AQI would create a proxy form of target leakage. The model would become dependent on another AQI forecast instead of learning AQI from pollutant and weather conditions.
+
+Therefore:
+
+* Open-Meteo `us_aqi` was used as the training target/reference.
+* Future Open-Meteo AQI was used only for comparison and validation.
+* Production features were limited to pollutant, weather, and deterministic time-based variables.
+
+This makes the model more independent, interpretable, and closer to a real forecasting system.
+
+---
+
+## Pollutant Unit Conversion
+
+Pollutant features were engineered to match AQI-style measurement conventions.
+
+| Pollutant | Raw Input Unit | Engineering Applied                                              | Final Feature |
+| --------- | -------------- | ---------------------------------------------------------------- | ------------- |
+| PM2.5     | µg/m³          | 24-hour rolling average                                          | `pm25_24h`    |
+| PM10      | µg/m³          | 24-hour rolling average                                          | `pm10_24h`    |
+| O₃        | µg/m³ → ppb    | `ppb = (µg/m³ × 24.45) / 48.00`; 8-hour rolling average          | `o3_8h_ppb`   |
+| CO        | µg/m³ → ppm    | `ppm = (µg/m³ × 24.45) / (28.01 × 1000)`; 8-hour rolling average | `co_8h_ppm`   |
+| NO₂       | µg/m³ → ppb    | `ppb = (µg/m³ × 24.45) / 46.0055`; 1-hour feature                | `no2_1h_ppb`  |
+
+These conversions were not used to manually calculate AQI. The model target remained Open-Meteo’s `us_aqi`. The conversions made the input features more scientifically meaningful and AQI-aligned.
+
+---
+
+## Model Training
+
+The training pipeline compares three models:
+
+1. Ridge Regression
+2. Random Forest
+3. XGBoost
+
+A time-based train-test split was used instead of a random split. The dataset was sorted by timestamp, with older records used for training and newer records used for testing. This better simulates real forecasting because the model learns from the past and predicts future values.
+
+### Final Model Results
+
+| Model            | Train MAE | Train RMSE | Train R² | Test MAE | Test RMSE | Test R² |
+| ---------------- | --------: | ---------: | -------: | -------: | --------: | ------: |
+| XGBoost          |    1.1049 |     1.5423 |   0.9973 |   2.0749 |    3.9196 |  0.9619 |
+| Random Forest    |    0.8088 |     1.4747 |   0.9975 |   2.0045 |    4.3100 |  0.9539 |
+| Ridge Regression |    5.7771 |     8.7000 |   0.9144 |   5.3275 |    7.6916 |  0.8532 |
+
+XGBoost was selected as the final model because it achieved the best overall balance, with the lowest test RMSE and highest test R².
+
+---
+
+## Automation
+
+GitHub Actions manages the scheduled pipelines.
+
+### Hourly Feature Pipeline
+
+Runs every hour at minute 10.
+
+```yaml
+cron: "10 * * * *"
+```
+
+Responsibilities:
+
+* Fetch future Open-Meteo weather and air-quality data.
+* Generate 72-hour forecast features.
+* Store features in the Hopsworks forecast Feature Group.
+
+### Daily Training Pipeline
+
+Runs daily at 12:10 AM Pakistan time.
+
+```yaml
+cron: "10 19 * * *"
+```
+
+GitHub Actions uses UTC, so `19:10 UTC` equals `12:10 AM PKT`.
+
+Responsibilities:
+
+* Backfill recent historical data.
+* Generate training features.
+* Train and evaluate models.
+* Register the best model in Hopsworks Model Registry.
+
+---
+
+## FastAPI Backend
+
+The FastAPI backend is responsible for inference.
+
+It:
+
+* Loads the best model from Hopsworks Model Registry.
+* Reads the latest forecast features from Hopsworks Feature Store.
+* Generates AQI predictions for the next 72 hours.
+* Returns results as JSON.
+
+### API Endpoints
+
+| Endpoint                | Purpose                                   |
+| ----------------------- | ----------------------------------------- |
+| `/health`               | Checks if the API is running              |
+| `/predictions?hours=72` | Returns 72-hour AQI predictions           |
+| `/refresh-cache`        | Clears cached model and feature resources |
+
+Run locally:
+
+```bash
+uvicorn api.main:app --reload --port 8000
+```
+
+Test locally:
+
+```bash
+http://127.0.0.1:8000/health
+http://127.0.0.1:8000/predictions?hours=72
+```
+
+---
+
+## Streamlit Dashboard
+
+The Streamlit dashboard is the UI layer.
+
+It displays:
+
+* Current forecast AQI
+* AQI category
+* 3-day average AQI
+* Peak AQI
+* Daily forecast cards
+* Hourly AQI trend
+* Pollutant breakdown
+* AQI warning alerts
+* Full forecast table
+
+The dashboard does not directly load the model. It calls the FastAPI backend using:
+
+```env
+FASTAPI_URL=https://ayyan22bscs046-hyderabad-aqi-api.hf.space
+```
+
+Run locally:
+
+```bash
+streamlit run app/app.py
 ```
 
 ---
@@ -181,16 +377,21 @@ Create a `.env` file locally:
 
 ```env
 CITY_NAME=Hyderabad
-COUNTRY_NAME=Pakistan
 COUNTRY_CODE=PK
+COUNTRY_NAME=Pakistan
 TIMEZONE=Asia/Karachi
 
 LATITUDE=25.3960
 LONGITUDE=68.3578
 
-HOPSWORKS_HOST=eu-west.cloud.hopsworks.ai
-HOPSWORKS_PROJECT=your_hopsworks_project_name
+FORECAST_PAST_DAYS=2
+FORECAST_DAYS=5
+PREDICTION_HOURS=72
+
+HOPSWORKS_HOST=your_hopsworks_host
+HOPSWORKS_PROJECT=your_hopsworks_project
 HOPSWORKS_API_KEY=your_hopsworks_api_key
+HOPSWORKS_ONLINE_ENABLED=false
 
 FEATURE_GROUP_NAME=aqi_openmeteo_19f_training_fg
 FEATURE_GROUP_VERSION=1
@@ -199,287 +400,215 @@ FORECAST_FEATURE_GROUP_NAME=aqi_openmeteo_19f_forecast_fg
 FORECAST_FEATURE_GROUP_VERSION=1
 
 MODEL_NAME=aqi_openmeteo_19f_best_model
-TARGET_COLUMN=us_aqi
+MODEL_OUTPUT_PATH=models/best_model.pkl
 
-BACKFILL_DAYS=180
-BACKFILL_CHUNK_DAYS=30
-
-FORECAST_PAST_DAYS=2
-FORECAST_DAYS=5
-PREDICTION_HOURS=72
-
-HOPSWORKS_ONLINE_ENABLED=false
+FASTAPI_URL=http://127.0.0.1:8000
 ```
 
-Do not commit `.env` to GitHub.
+Never commit `.env` to GitHub.
 
 ---
 
 ## Installation
 
-Create and activate a virtual environment:
+Clone the repository:
+
+```bash
+git clone https://github.com/AyyanAfzal/aqi_prediction_project.git
+cd aqi_prediction_project
+```
+
+Create virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+Activate virtual environment:
+
+### Windows PowerShell
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\Activate.ps1
+```
+
+### macOS/Linux
+
+```bash
+source .venv/bin/activate
 ```
 
 Install dependencies:
 
-```powershell
+```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Recommended Hopsworks version:
+For notebook/EDA work:
 
-```text
-hopsworks[python]==4.7.*
+```bash
+pip install -r requirements-dev.txt
 ```
 
 ---
 
-## Run Pipelines Locally
+## Running the Project Locally
 
 ### 1. Run Backfill Pipeline
 
-Fetches historical data, creates 19-feature training rows, and uploads to Hopsworks.
-
-```powershell
+```bash
 python pipelines/backfill_pipeline.py
 ```
 
 ### 2. Run Training Pipeline
 
-Trains multiple models, selects the best model, and uploads it to Hopsworks Model Registry.
-
-```powershell
+```bash
 python pipelines/training_pipeline.py
 ```
 
 ### 3. Run Feature Pipeline
 
-Fetches latest forecast data, creates 19-feature future rows, and uploads to Hopsworks.
-
-```powershell
+```bash
 python pipelines/feature_pipeline.py
 ```
 
-### 4. Run Streamlit Dashboard
+### 4. Start FastAPI Backend
 
-```powershell
+```bash
+uvicorn api.main:app --reload --port 8000
+```
+
+### 5. Start Streamlit Dashboard
+
+Open a second terminal:
+
+```bash
 streamlit run app/app.py
 ```
 
 ---
 
-## Streamlit Dashboard
+## Deployment
 
-The Streamlit app loads:
+### FastAPI Backend
 
-1. Latest future forecast features from:
+The FastAPI backend is deployed on Hugging Face Spaces using Docker.
 
-```text
-aqi_openmeteo_19f_forecast_fg
-```
-
-2. Latest trained model from:
+Required files:
 
 ```text
-aqi_openmeteo_19f_best_model
+Dockerfile
+requirements.txt
+api/main.py
+api/__init__.py
 ```
 
-Then it predicts the next 72 hours AQI and displays:
+The Dockerfile starts the backend using:
 
-- Current AQI
-- 3-day average AQI
-- Peak AQI
-- AQI category
-- 3-day AQI cards
-- Hourly AQI trend
-- Pollutant levels
-- Forecast tables
-
----
-
-## GitHub Actions
-
-This project uses two automation workflows.
-
-### Hourly Feature Pipeline
-
-Runs every hour and updates future forecast features.
-
-```text
-.github/workflows/feature_pipeline.yml
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 7860
 ```
 
-Main job:
+### Streamlit Frontend
 
-```text
-python pipelines/feature_pipeline.py
-```
+The dashboard is deployed on Streamlit Cloud.
 
-Updates:
-
-```text
-aqi_openmeteo_19f_forecast_fg
-```
-
-### Nightly Backfill and Model Training
-
-Runs once daily and updates the training data and best model.
-
-```text
-.github/workflows/training_pipeline.yml
-```
-
-Main jobs:
-
-```text
-python pipelines/backfill_pipeline.py
-python pipelines/training_pipeline.py
-```
-
-Updates:
-
-```text
-aqi_openmeteo_19f_training_fg
-aqi_openmeteo_19f_best_model
-```
-
-The daily workflow does not run the feature pipeline because forecast feature generation is handled by the hourly workflow.
-
----
-
-## GitHub Secrets
-
-Add these secrets in GitHub:
-
-```text
-HOPSWORKS_HOST
-HOPSWORKS_PROJECT
-HOPSWORKS_API_KEY
-```
-
-Go to:
-
-```text
-GitHub Repository → Settings → Secrets and variables → Actions
-```
-
----
-
-## Streamlit Cloud Deployment
-
-Deploy the app using Streamlit Community Cloud.
-
-Main file path:
-
-```text
-app/app.py
-```
-
-Python version:
-
-```text
-3.11
-```
-
-Add these secrets in Streamlit Cloud:
+Streamlit Cloud secrets:
 
 ```toml
-HOPSWORKS_HOST = "eu-west.cloud.hopsworks.ai"
-HOPSWORKS_PROJECT = "your_hopsworks_project_name"
-HOPSWORKS_API_KEY = "your_hopsworks_api_key"
-
-CITY_NAME = "Hyderabad"
-COUNTRY_NAME = "Pakistan"
-COUNTRY_CODE = "PK"
-TIMEZONE = "Asia/Karachi"
-
-FEATURE_GROUP_NAME = "aqi_openmeteo_19f_training_fg"
-FEATURE_GROUP_VERSION = "1"
-
-FORECAST_FEATURE_GROUP_NAME = "aqi_openmeteo_19f_forecast_fg"
-FORECAST_FEATURE_GROUP_VERSION = "1"
-
-MODEL_NAME = "aqi_openmeteo_19f_best_model"
-TARGET_COLUMN = "us_aqi"
-
+FASTAPI_URL = "https://ayyan22bscs046-hyderabad-aqi-api.hf.space"
 PREDICTION_HOURS = "72"
 ```
 
 ---
 
-## Important Notes
+## EDA and Explainability
 
-- The training target is:
+The project includes exploratory data analysis and explainability:
 
-```text
-us_aqi
-```
+* Feature distribution analysis
+* Bivariate pollutant/weather vs AQI analysis
+* Feature drift analysis
+* SHAP feature importance
+* SHAP beeswarm-style plot
+* Actual vs predicted AQI plot
 
-- The forecast comparison/reference column is:
-
-```text
-openmeteo_us_aqi_reference
-```
-
-- The model predicts AQI using forecast features.
-- The Streamlit app performs prediction at runtime by loading the model and forecast rows from Hopsworks.
-- Generated folders like `reports/`, `data/`, and `models/` should not be committed unless needed.
+SHAP confirmed that `pm25_24h` was the strongest model driver, followed by ozone and PM10-related features. This is scientifically reasonable because particulate matter is a major contributor to AQI.
 
 ---
 
-## Recommended Git Ignore
+## Key Design Decisions
 
-Add these to `.gitignore`:
-
-```gitignore
-.env
-.venv/
-__pycache__/
-*.pyc
-
-reports/
-data/
-models/
-
-.DS_Store
-```
+| Decision                                   | Reason                                                                    |
+| ------------------------------------------ | ------------------------------------------------------------------------- |
+| Removed AQI lag features                   | They would not be available for future timestamps and could cause leakage |
+| Did not use future Open-Meteo AQI as input | It would act as proxy target leakage                                      |
+| Used pollutant/weather forecast features   | These are genuinely available for future hours                            |
+| Used time-based split                      | Better reflects real forecasting                                          |
+| Excluded month features                    | 180-day training window does not cover full yearly seasonality            |
+| Used FastAPI separately from Streamlit     | Cleaner architecture and easier deployment                                |
+| Kept Hopsworks offline feature groups      | Hourly dashboard does not need millisecond-level online serving           |
 
 ---
 
-## Manual Test Order
+## Known Limitations
 
-Before deploying or pushing major changes, run:
-
-```powershell
-python pipelines/backfill_pipeline.py
-python pipelines/training_pipeline.py
-python pipelines/feature_pipeline.py
-streamlit run app/app.py
-```
+* The model depends on the quality of Open-Meteo forecast data.
+* The training dataset covers around 6 months, not multiple years.
+* The model is currently built for Hyderabad only.
+* Hugging Face free Spaces may sleep after inactivity, causing slower first requests.
+* Deep learning models were not included due to dataset size and deployment constraints.
 
 ---
 
-## Status
+## Future Improvements
 
-Current version:
+* Extend the system to multiple cities.
+* Increase historical training data to multiple years.
+* Add real-time alert notifications.
+* Add online Hopsworks feature serving for lower-latency API predictions.
+* Add model drift monitoring to the dashboard.
+* Compare against ground-truth local sensor data.
+* Experiment with temporal deep learning models when enough data is available.
 
-```text
-19-feature AQI forecasting system
-```
+---
 
-Feature setup:
+## Final Validation
 
-```text
-12 base features + 7 time-based features
-```
+The deployed FastAPI endpoint successfully returned a full 72-hour prediction payload.
 
-Deployment target:
+Final validation values:
 
-```text
-Streamlit Cloud
-```
+| Metric               |    Value | Category         |
+| -------------------- | -------: | ---------------- |
+| Current forecast AQI |     75.1 | Moderate         |
+| 72-hour average AQI  |     73.4 | Moderate         |
+| Peak AQI             |     77.5 | Moderate         |
+| Forecast window      | 72 hours | 3 days           |
+| Deployed model       |  XGBoost | 19-feature model |
+
+---
+
+## Author
+
+**Ayyan Afzal**
+
+Computer Science Student
+Project: Serverless AQI Predictor for Hyderabad, Pakistan
+
+---
+
+## References
+
+* Open-Meteo Weather API
+* Open-Meteo Air Quality API
+* Hopsworks Feature Store Documentation
+* Hopsworks Model Registry Documentation
+* GitHub Actions Documentation
+* FastAPI Documentation
+* Streamlit Documentation
+* Hugging Face Spaces Docker Documentation
+* Scikit-learn Documentation
+* XGBoost Documentation
+* SHAP Documentation
